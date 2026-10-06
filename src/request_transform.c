@@ -53,6 +53,7 @@
 #include "nvme/host_lld.h"
 #include "memory_map.h"
 #include "ftl_config.h"
+#include "exp_stat.h"	/* EXP */
 
 P_ROW_ADDR_DEPENDENCY_TABLE rowAddrDependencyTablePtr;
 
@@ -184,6 +185,8 @@ void EvictDataBufEntry(unsigned int originReqSlotTag)
 		reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = virtualSliceAddr;
 
 		SelectLowLevelReqQ(reqSlotTag);
+
+		exp_on_nand_program(EXP_PROG_HOST, BYTES_PER_DATA_REGION_OF_SLICE);	/* EXP: NAND program of host data */
 
 		dataBufMapPtr->dataBuf[dataBufEntry].dirty = DATA_BUF_CLEAN;
 	}

@@ -54,6 +54,7 @@
 #include "host_lld.h"
 #include "nvme_identify.h"
 #include "nvme_admin_cmd.h"
+#include "../exp_stat.h"	/* EXP */
 
 extern NVME_CONTEXT g_nvmeTask;
 
@@ -500,6 +501,29 @@ void handle_nvme_admin_cmd(NVME_COMMAND *nvmeCmd)
 		{
 			needCpl = 0;
 			needSlotRelease = 0;
+			nvmeCPL.dword[0] = 0;
+			nvmeCPL.specific = 0x0;
+			break;
+		}
+		case EXP_ADMIN_OPC_MARKER:	/* EXP: print counters to UART (cdw10 = 1: then reset) */
+		{
+			exp_stat_on_marker(nvmeAdminCmd->dword10);
+			nvmeCPL.dword[0] = 0;
+			nvmeCPL.specific = 0x0;
+			break;
+		}
+		case EXP_ADMIN_OPC_SNAPSHOT:	/* EXP: return counters to the host in a 4KB buffer */
+		{
+			unsigned int prpLen;
+
+			exp_stat_snapshot((void *)ADMIN_CMD_DRAM_DATA_BUFFER);
+
+			prpLen = 0x1000 - (nvmeAdminCmd->PRP1[0] & 0xFFF);
+			set_direct_tx_dma(ADMIN_CMD_DRAM_DATA_BUFFER, nvmeAdminCmd->PRP1[1], nvmeAdminCmd->PRP1[0], prpLen);
+			if(prpLen != 0x1000)
+				set_direct_tx_dma(ADMIN_CMD_DRAM_DATA_BUFFER + prpLen, nvmeAdminCmd->PRP2[1], nvmeAdminCmd->PRP2[0], 0x1000 - prpLen);
+			check_direct_tx_dma_done();
+
 			nvmeCPL.dword[0] = 0;
 			nvmeCPL.specific = 0x0;
 			break;
