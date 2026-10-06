@@ -29,9 +29,9 @@ typedef enum {
 } io_log_event_type_t;
 
 typedef struct {
-    uint64_t device_tick_ns;   /* FEMU 내부 틱 또는 gettimeofday 기반 ns */
+    uint64_t device_tick_ns;   /* 벽시계 기준 ns (now_ns 참고) */
     io_log_event_type_t type;
-    uint64_t lba;              /* 이벤트 대상 LBA (시작 주소) */
+    uint64_t lba;              /* 이벤트 대상 LBA (시작 주소). 단위는 FEMU의 LBA 크기(보통 512바이트) */
     uint32_t length_bytes;     /* 길이 (page 단위라면 page_size) */
     uint64_t src_ppa;          /* GC_COPY일 때만 의미 있음 */
     uint64_t dst_ppa;          /* GC_COPY일 때만 의미 있음 */
@@ -42,10 +42,16 @@ static io_log_record_t g_io_log[IO_LOG_MAX_EVENTS];
 static uint64_t g_io_log_count = 0;
 static uint64_t g_io_log_dropped = 0;
 
+/*
+ * 벽시계(CLOCK_REALTIME)를 쓴다. 분석 스크립트가 이 시각을 게스트의 `date +%s%N`
+ * (host_events.csv)과 비교하기 때문이다. CLOCK_MONOTONIC 은 부팅 뒤 경과 시간이라
+ * 게스트 시각과 기준이 달라 비교할 수 없다. 게스트와 호스트의 시계가 맞는지는
+ * 실험 전에 확인한다(README_PATCH.md 6절).
+ */
 static inline uint64_t now_ns(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 

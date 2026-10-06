@@ -19,7 +19,7 @@ if [[ "$serial" != "$EXPECTED_SERIAL" ]]; then
   echo "시리얼 불일치: $DEV 는 '$serial' 입니다. 중단합니다." >&2
   exit 1
 fi
-if findmnt -S "$DEV" >/dev/null || lsblk -no MOUNTPOINTS "$DEV" | grep -q .; then
+if findmnt -S "$DEV" >/dev/null || lsblk -no MOUNTPOINT "$DEV" | grep -q .; then
   echo "$DEV 또는 그 파티션이 마운트되어 있습니다. umount 후 다시 실행하세요." >&2
   exit 1
 fi

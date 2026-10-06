@@ -1,44 +1,91 @@
-# SSD Discard 방식별 GC 영향 실험 — 코드 모음
+# discard 방식별 GC 영향 실험 — 실행 코드
 
-"대량 삭제 워크로드에서 discard 방식이 SSD 내부 GC에 미치는 영향" 연구용 실행 코드.
+"대량 삭제 워크로드에서 ext4 discard 전달 방식이 SSD 내부 GC와 호스트 지연에 미치는 영향" 실험을 실행하고 정리하는 코드다. Cosmos+ OpenSSD 보드(주 실험)와 FEMU(보조 실험)에서 같은 스크립트를 쓴다.
 
-## 디렉토리 구조
+비교하는 정책은 네 가지다.
+
+| 이름 | 동작 |
+| --- | --- |
+| `nodiscard` (`none`) | discard를 보내지 않음 |
+| `immediate` | `mount -o discard`. 삭제할 때마다 전달 |
+| `batch` (`fstrim`) | `TRIM_EVERY` cycle마다 `fstrim` 한 번 |
+| `split` | 같은 시점에 `fstrim`을 K조각으로 나눠 조각 사이에 쉼 |
+
+## 구성
 
 ```
 ssd_discard_experiment/
-├── femu_patch/                 # FEMU FTL에 끼워넣을 계측 코드 템플릿
-│   ├── ftl_instrumentation.c   # GC copy / discard 도착 로깅 템플릿
-│   └── README_PATCH.md         # 어디에 어떻게 붙일지 설명
 ├── scripts/
-│   ├── workloads/
-│   │   ├── w1_retention_delete.sh   # 시계열DB형 보존기간 만료 삭제 (주 워크로드)
-│   │   ├── w2_checkpoint_rotate.sh  # 체크포인트 순환 삭제
-│   │   └── w3_random_overwrite.sh   # 대조군 (삭제 없음, fio 랜덤 쓰기)
-│   ├── apply_discard_policy.sh # mount/fstrim으로 discard 정책 적용
-│   ├── record_deletion.sh      # filefrag로 삭제 직전 LBA 범위 기록
-│   ├── run_experiment.sh       # 단일 조합(fs×workload×discard×util) 1회 실행
-│   └── run_all.sh              # 전체 조합 반복 실행 (POC / 본실험)
-└── analysis/
-    ├── correlate_and_compute.py # 호스트 로그 + FTL 로그를 맞춰 지표 계산
-    └── requirements.txt
+│   ├── common.sh                 공통 함수: 장치 확인, 이벤트 기록, TRIM, 카운터 스냅샷
+│   ├── apply_discard_policy.sh   포맷하고 정책에 맞게 마운트
+│   ├── run_experiment.sh         한 조합(워크로드 × 정책) 1회 실행
+│   ├── run_all.sh                여러 조합 반복 실행 (poc / main / ksweep / ctrl)
+│   └── workloads/
+│       ├── w1_retention_delete.sh   보존 기간 만료형 삭제 (주 워크로드)
+│       ├── w2_checkpoint_rotate.sh  체크포인트 순환
+│       └── w3_random_overwrite.sh   삭제 없는 대조군
+├── analysis/
+│   ├── correlate_and_compute.py  실행 하나를 summary.json 으로 정리
+│   └── aggregate_and_plot.py     여러 실행을 정책별 표와 그래프로
+└── femu_patch/                   FEMU FTL에 넣을 이벤트 기록 코드(템플릿)
 ```
 
-## 실행 순서
+저장소의 다른 폴더와의 관계:
 
-1. **femu_patch/** 의 코드를 FEMU 소스(GC 함수, discard/Deallocate 처리 함수)에 삽입하고 빌드
-2. `scripts/run_experiment.sh` 를 손으로 1~2회 돌려서 로그가 정상적으로 쌓이는지 확인 (PDF의 POC 단계)
-3. 문제없으면 `scripts/run_all.sh` 로 전체 조합(또는 축소한 9회) 자동 실행
-4. `analysis/correlate_and_compute.py` 로 죽은 데이터 복사량 / WAF / p99 지연 계산 및 CSV·그래프 출력
+- `src/` — Cosmos+ 펌웨어. Deallocate 처리와 카운터(`exp_stat`)가 들어 있다.
+- `tools/parse_expstat.py` — 펌웨어 카운터 스냅샷 해석. `EXPSTAT=1`일 때 이 폴더의 스크립트가 호출한다.
+- `tools/split_trim.sh` — `split` 정책이 호출한다.
+- `tools/fw_verify.sh` — 실험 전에 펌웨어가 정상인지 확인한다. 통과한 뒤에 이 폴더의 스크립트를 쓴다.
 
-## 결과 파일 (runs/<run_id>/ 아래에 저장됨)
+## 실행
 
-- `host_events.csv` — 파일 생성/삭제 시각, filefrag로 얻은 LBA 범위
-- `ftl_gc_log.csv` — FEMU가 남긴 GC 복사 이벤트 (LBA, 시각)
-- `ftl_discard_log.csv` — FEMU가 남긴 discard 도착 이벤트 (LBA, 시각)
-- `fio_probe.json` — 배경 읽기 probe의 지연 분포 (p50/p95/p99)
-- `manifest.json` — 이 실행의 모든 설정값 기록
+모든 스크립트는 root로 실행한다. 장치는 시리얼로 지정한다. 보드를 재부팅하면 `/dev/nvme0n1`과 `/dev/nvme1n1`이 바뀔 수 있기 때문이다.
+
+```bash
+sudo nvme list            # OpenSSD의 시리얼 확인
+cd ssd_discard_experiment/scripts
+export EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1
+
+sudo -E ./run_experiment.sh w1 batch 5 1   # W1, 5 cycle마다 fstrim, 1회차
+sudo -E ./run_all.sh poc                   # W1 × 4정책 × 1회
+sudo -E ./run_all.sh main                  # W1 × 4정책 × 5회 (REPS로 조정)
+sudo -E ./run_all.sh ksweep                # split의 K = 1, 4, 8, 16
+sudo -E ./run_all.sh ctrl                  # W3 × 4정책 (대조군)
+
+python3 ../analysis/aggregate_and_plot.py ../runs --out-dir ../report
+```
+
+- `EXPSTAT=1`은 계측 펌웨어를 올린 Cosmos+ 보드에서만 쓴다. 원본 펌웨어는 모르는 admin 명령을 받으면 멈춘다.
+- FEMU에서는 `EXPSTAT`을 빼고, 시리얼이 없으면 `DEV=/dev/nvme0n1`처럼 장치를 직접 준다(이때는 포맷 전에 확인을 묻는다). 실행 뒤 FEMU 로그를 실행 폴더에 복사해 분석을 다시 돌린다(`femu_patch/README_PATCH.md`).
+- `run_all.sh`는 실행마다 멈춰서 보드를 재부팅할 시간을 준다. Cosmos+는 재부팅하면 FTL이 빈 상태로 돌아가므로 모든 실행이 같은 상태에서 시작한다.
+
+### 크기는 장치 용량에 맞춰 정해진다
+
+장치가 충분히 차지 않으면 GC가 일어나지 않아 정책 간 차이가 나오지 않는다. 그래서 `run_experiment.sh`는 마운트한 뒤 용량을 읽어 크기를 정한다(`AUTO_SIZE=1`, 기본).
+
+- 목표 사용률 `U`(기본 0.85)까지 사전 쓰기로 채운 뒤 측정을 시작한다.
+- cycle마다 용량의 `DEL_FRAC`(기본 0.10)만큼 지우고 같은 양을 새로 쓴다.
+- `NUM_CYCLES`(기본 20)면 측정 구간에 용량의 약 2배를 쓴다.
+
+직접 정하려면 `AUTO_SIZE=0`과 함께 워크로드 스크립트의 환경변수를 준다.
+
+## 결과 (`runs/<run_id>/`)
+
+| 파일 | 내용 |
+| --- | --- |
+| `manifest.json` | 설정값, 장치 시리얼, 마운트 옵션, 커널·fio 버전 |
+| `host_events.csv` | 파일 생성·삭제·TRIM·cycle 시각과 파일이 차지한 장치 범위 |
+| `expstat_start/c<N>/end.bin` | 펌웨어 카운터 스냅샷 (측정 시작, cycle마다, 끝) |
+| `expstat_summary.json` | 측정 구간의 카운터 차이, WAF, DSM 처리 시간 |
+| `fio_probe.json`, `probe_lat.1.log` | 배경 읽기 probe의 지연 |
+| `fstrim_output.log` | fstrim이 보고한 TRIM 양 |
+| `summary.json` | 위를 모은 한 실행의 요약. `verdict`가 `valid`가 아니면 그 실행은 버린다 |
+
+`host_events.csv`의 `start_lba`는 장치 기준 4KB 블록 번호, `length_bytes`는 바이트다.
 
 ## 주의
 
-- 실험 대상 장치(DEV) 경로를 반드시 먼저 확인하세요. 스크립트가 실수로 OS 디스크를 포맷하지 않도록, 모든 스크립트는 `DEV` 환경변수를 명시적으로 요구하고 실행 전 확인 프롬프트를 띄웁니다.
-- FEMU 빌드/커밋 버전에 따라 GC·discard 처리 함수 이름이 다를 수 있습니다 (PDF에서도 "함수명을 미리 확정하지 않는다"고 명시). `femu_patch/README_PATCH.md` 를 참고해 실제 소스에 맞게 삽입 위치를 찾으세요.
+- 스크립트는 대상 장치를 포맷한다. `/`나 `/boot`가 올라가 있는 디스크는 거부하지만, 시리얼을 직접 확인하고 실행한다.
+- 결과는 저장소 안의 `runs/`에 쌓인다(git에는 올리지 않음). 실험 장치의 마운트 지점 아래에 두지 않는다.
+- 삭제된 데이터의 복사량(`dead_copy_*`)은 FEMU 이벤트 로그가 있을 때만 계산된다. 보드는 합계 카운터만 남기므로 보드 실험의 주 지표는 GC 복사량과 nodiscard 대비 감소율이다.
+- 정책 간 TRIM 총량이 같다고 가정하지 않는다. `summary.json`의 `dsm_req_bytes`, `dsm_invalid_bytes`로 실제 전달량을 함께 본다.

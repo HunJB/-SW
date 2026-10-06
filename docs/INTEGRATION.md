@@ -14,7 +14,8 @@ PC에서 한 것은 문법 검사, 처리 로직 시험, 보드 동작을 흉내
 | `tests/host/` | PC에서 돌리는 로직 시험 (`make test`) |
 | `tools/fw_verify.sh` | 보드 검증 T0~T5 |
 | `tools/parse_expstat.py` | 스냅샷 두 개의 차이, WAF, DSM 분포 계산 |
-| `tools/w1_runner.sh`, `split_trim.sh` | 4가지 방식 측정 실행기 |
+| `tools/split_trim.sh` | Split Batch용 fstrim 분할 |
+| `ssd_discard_experiment/` | 4가지 방식 측정 실행기(W1~W3)와 분석 스크립트. 자체 README 참고 |
 | `tools/discard_check.sh` | discard 뒤 쓰기 성능이 회복되는지 확인(장치 전체를 채우므로 오래 걸림) |
 
 DSM 통계는 `exp_stat` 한 곳에만 둔다. `dsm_deallocate.c`는 자체 통계 구조체 없이 `exp_on_dsm_*()`만 호출한다.
@@ -76,15 +77,17 @@ T0~T5를 통과한 뒤, GC가 실제로 줄어드는지는 `discard_check.sh`로
 
 ## 5. 측정
 
-```bash
-# 한 번 실행 (예: Batch, 1회차). 실행마다 보드를 재부팅해 FTL을 같은 초기 상태로 만든다.
-sudo DEV=/dev/nvme1n1 EXPECTED_SERIAL=<시리얼> POLICY=batch REP=1 EXPSTAT=1 ./w1_runner.sh
+측정은 `ssd_discard_experiment/scripts`에서 한다. 자세한 사용법은 그 폴더의 README에 있다.
 
-# Split Batch 조각 수 바꾸기
-sudo DEV=... EXPECTED_SERIAL=... POLICY=split K=16 REP=1 EXPSTAT=1 ./w1_runner.sh
+```bash
+cd ssd_discard_experiment/scripts
+export EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1
+sudo -E ./run_experiment.sh w1 batch 5 1     # 한 번 실행
+sudo -E ./run_all.sh main                    # W1 × 4정책 × 5회
+sudo -E ./run_all.sh ksweep                  # Split Batch 조각 수 K = 1, 4, 8, 16
 ```
 
-`EXPSTAT=1`이면 측정 시작·끝과 cycle마다 스냅샷을 저장하고, 끝나면 `summary.txt`, `summary.json`을 만든다. `manifest.txt` 마지막 줄의 `verdict`가 `valid`가 아니면 그 실행은 버린다(No Discard인데 discard가 도달했거나, 다른 방식인데 한 번도 도달하지 않았거나, 중간에 보드가 재부팅된 경우).
+`EXPSTAT=1`이면 측정 시작·끝과 cycle마다 스냅샷을 저장하고, 끝나면 `summary.json`을 만든다. `verdict`가 `valid`가 아니면 그 실행은 버린다(No Discard인데 discard가 도달했거나, 다른 방식인데 한 번도 도달하지 않았거나, 중간에 보드가 재부팅된 경우).
 
 스냅샷을 직접 받을 때:
 
@@ -114,6 +117,7 @@ python3 parse_expstat.py --bin start.bin end.bin
 
 ## 6. 알고 써야 할 점
 
+- **패치 전 보드에는 스냅샷 명령(0xC2)도 보내지 않는다.** 원본 펌웨어는 모르는 admin 명령에도 멈춘다. `EXPSTAT=1`은 계측 펌웨어에서만 쓴다.
 - **패치 전 보드에는 discard를 보내지 않는다.** `nvme dsm` 같은 passthrough 명령은 커널을 거치지 않고 보드에 도달하고, 원본 펌웨어는 모르는 I/O 명령을 받으면 멈춘다. `blkdiscard`와 `fw_verify.sh`는 장치가 지원을 표시하지 않으면 보내지 않는다.
 - **보드를 재부팅하면 데이터가 모두 지워진다.** 매핑이 DRAM에만 있고 부팅 때 전체 erase를 한다. 반복 실행의 초기 상태를 맞추는 데는 유리하다.
 - **마지막에 쓴 2MB는 discard되지 않는다.** data buffer(128 엔트리)에 남은 slice는 건너뛴다. 파일을 지우기 직전에 쓴 데이터가 여기에 해당하며 `dsm_busy_B`로 양을 확인할 수 있다.

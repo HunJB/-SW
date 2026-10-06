@@ -54,3 +54,12 @@ sudo umount /mnt/test
 ```
 
 이 스모크 테스트에서 discard 이벤트가 안 잡히면, FEMU가 애초에 DSM을 처리하지 않는 버전일 수 있습니다 (연구 PDF 8장에서 이미 예상한 상황). 그 경우 `nvme_dsm()` 자체에 Deallocate 처리 로직을 새로 추가해야 합니다.
+
+## 6. 분석 스크립트와 맞춰야 하는 두 가지
+
+`analysis/correlate_and_compute.py`는 이 로그를 게스트에서 남긴 `host_events.csv`와 맞춰 본다.
+
+- **시각**: 로그는 호스트의 벽시계(`CLOCK_REALTIME`), 게스트 이벤트는 게스트의 `date +%s%N`이다. 실험 전에 게스트와 호스트에서 `date +%s.%N`을 동시에 찍어 차이가 수 ms 이내인지 확인한다. 차이가 크면 삭제 시각과 GC 시각의 앞뒤 판단이 틀어진다.
+- **LBA 단위**: 로그의 `lba`는 FEMU의 LBA 단위, 호스트 이벤트의 `start_lba`는 4KB 블록 단위다. 스크립트는 둘을 바이트로 바꿔 비교하며, FEMU의 LBA 크기가 512바이트가 아니면 `--ftl-lba-bytes`로 알려 준다. 파티션을 만들지 않고 장치 전체에 파일시스템을 올려야 주소가 그대로 맞는다.
+
+실행이 끝나면 `/tmp/femu_ftl_log.csv`를 해당 실행 폴더에 `ftl_gc_log.csv`라는 이름으로 복사하고 분석 스크립트를 다시 돌린다.

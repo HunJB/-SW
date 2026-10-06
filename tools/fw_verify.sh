@@ -65,7 +65,7 @@ flush_buf() { wr /dev/zero 1536 4; }
 say "== T0 장치 확인 =="
 serial=$(lsblk -dno SERIAL "$DEV" | tr -d ' ')
 [[ "$serial" == "$EXPECTED_SERIAL" ]] || fail "시리얼 불일치: $DEV 는 '$serial'"
-if findmnt -S "$DEV" >/dev/null || lsblk -no MOUNTPOINTS "$DEV" | grep -q .; then
+if findmnt -S "$DEV" >/dev/null || lsblk -no MOUNTPOINT "$DEV" | grep -q .; then
   fail "$DEV 또는 그 파티션이 마운트되어 있음. umount 후 다시 실행"
 fi
 size=$(blockdev --getsize64 "$DEV")
