@@ -133,6 +133,8 @@ void exp_stat_dump(const char *tag)
     print_kv("dsm_already_free_B", s->dsm_already_free_bytes);
     print_kv("dsm_ticks", s->dsm_ticks_total);
     print_kv("dsm_ticks_max", s->dsm_ticks_max);
+    print_kv("dsm_busy_B", s->dsm_busy_skip_bytes);
+    print_kv("dsm_err", s->dsm_error_count);
 
     print_kv("dsm_nest_err", s->dsm_nesting_error);
     xil_printf("\r\n");
@@ -167,10 +169,11 @@ exp_u32 exp_stat_snapshot(void *buf)
     out[0] = EXP_SNAPSHOT_MAGIC;
     out[1] = (exp_u64)now;
     out[2] = (exp_u64)COUNTS_PER_SECOND;
-    for (i = 0; i < n; i++)
-        out[3 + i] = src[i];
+    out[3] = (exp_u64)n;
+    for (i = 0; i < n && (EXP_SNAPSHOT_HEADER_NR + i) < EXP_SNAPSHOT_BYTES / sizeof(exp_u64); i++)
+        out[EXP_SNAPSHOT_HEADER_NR + i] = src[i];
 
-    return (exp_u32)((3 + n) * sizeof(exp_u64));
+    return (exp_u32)((EXP_SNAPSHOT_HEADER_NR + n) * sizeof(exp_u64));
 }
 
 void exp_stat_on_marker(exp_u32 arg)
@@ -202,5 +205,6 @@ void exp_dsm_end(void)
     g_exp_stat.dsm_ticks_total += d;
     if (d > g_exp_stat.dsm_ticks_max)
         g_exp_stat.dsm_ticks_max = d;
+    g_exp_stat.dsm_hist_ticks[exp_log2_bucket(d, EXP_HIST_TICKS_NR)]++;
     s_dsm_active = 0;
 }

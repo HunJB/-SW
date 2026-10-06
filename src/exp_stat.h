@@ -35,8 +35,13 @@ typedef unsigned int       exp_u32;
 #define EXP_ADMIN_OPC_MARKER    0xC0   /* print one line to UART. cdw10 = 1: reset afterwards */
 #define EXP_ADMIN_OPC_SNAPSHOT  0xC2   /* return counters to the host in a 4KB buffer */
 
-#define EXP_SNAPSHOT_MAGIC      0x3154415453505845ULL   /* "EXPSTAT1" (little endian) */
+#define EXP_SNAPSHOT_MAGIC      0x3254415453505845ULL   /* "EXPSTAT2" (little endian) */
 #define EXP_SNAPSHOT_BYTES      4096
+#define EXP_SNAPSHOT_HEADER_NR  4      /* magic, tick, counts per second, number of fields */
+
+/* histogram sizes (log2 buckets, one count per DSM command) */
+#define EXP_HIST_TICKS_NR       40     /* bucket i: 2^i <= handling time in timer ticks < 2^(i+1) */
+#define EXP_HIST_LBA_NR         32     /* bucket i: 2^i <= requested 4KB blocks < 2^(i+1) */
 
 /* cause of a NAND program */
 typedef enum {
@@ -83,6 +88,12 @@ typedef struct {
     /* self check */
     exp_u64 dsm_nesting_error;       /* end without begin, or nested begin */
     exp_u64 dump_seq;                /* dump sequence number */
+
+    /* --- added in snapshot version 2. Append new fields below, never reorder. --- */
+    exp_u64 dsm_busy_skip_bytes;     /* slice still in the DRAM data buffer, left mapped */
+    exp_u64 dsm_error_count;         /* command completed without touching the map (bad payload address) */
+    exp_u64 dsm_hist_ticks[EXP_HIST_TICKS_NR];   /* per-command handling time */
+    exp_u64 dsm_hist_lba[EXP_HIST_LBA_NR];       /* per-command requested size */
 } exp_stat_t;
 
 extern exp_stat_t g_exp_stat;
@@ -105,7 +116,8 @@ void exp_stat_poll(void);
 void exp_stat_on_marker(exp_u32 arg);
 
 /* write the counters to buf (4KB) in binary. Returns the bytes used.
- *   u64 magic, u64 tick, u64 counts_per_second, then exp_stat_t (all u64) */
+ *   u64 magic, u64 tick, u64 counts_per_second, u64 nfields, then exp_stat_t (nfields x u64).
+ * tools/parse_expstat.py lists the field names in the same order. */
 exp_u32 exp_stat_snapshot(void *buf);
 
 /* ---------- calls to place in the firmware ---------- */
@@ -145,12 +157,24 @@ static inline void exp_on_nand_program(exp_prog_cause_t cause, exp_u64 bytes)
         g_exp_stat.nand_prog_bytes[cause] += bytes;
 }
 
+/* floor(log2(v)), 0 for v <= 1, capped at nr - 1 */
+static inline unsigned int exp_log2_bucket(exp_u64 v, unsigned int nr)
+{
+    unsigned int b = 0;
+    while (v > 1) {
+        v >>= 1;
+        b++;
+    }
+    return (b < nr) ? b : (nr - 1);
+}
+
 /* once per DSM command (counted even without the Deallocate attribute) */
 static inline void exp_on_dsm_cmd(exp_u32 nranges, exp_u64 req_bytes)
 {
     g_exp_stat.dsm_cmd_count++;
     g_exp_stat.dsm_range_count += nranges;
     g_exp_stat.dsm_req_bytes += req_bytes;
+    g_exp_stat.dsm_hist_lba[exp_log2_bucket(req_bytes / 4096ULL, EXP_HIST_LBA_NR)]++;
 }
 
 /* a slice that was valid has been invalidated */
@@ -163,6 +187,18 @@ static inline void exp_on_dsm_invalidated(exp_u64 bytes)
 static inline void exp_on_dsm_ignored(exp_u64 bytes)
 {
     g_exp_stat.dsm_ignored_bytes += bytes;
+}
+
+/* slice skipped because it is still in the DRAM data buffer */
+static inline void exp_on_dsm_busy_skip(exp_u64 bytes)
+{
+    g_exp_stat.dsm_busy_skip_bytes += bytes;
+}
+
+/* command that could not be processed */
+static inline void exp_on_dsm_error(void)
+{
+    g_exp_stat.dsm_error_count++;
 }
 
 /* slice already unmapped */
