@@ -48,5 +48,6 @@
 #define __NVME_IO_CMD_H_
 
 void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd);
+void handle_nvme_io_dataset_management(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd);	/* EXP */
 
 #endif	//__NVME_IO_CMD_H_

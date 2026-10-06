@@ -48,6 +48,7 @@
 #include "xil_printf.h"
 #include <assert.h>
 #include "memory_map.h"
+#include "exp_stat.h"	/* EXP */
 
 P_GC_VICTIM_MAP gcVictimMapPtr;
 
@@ -71,6 +72,7 @@ void InitGcVictimMap()
 void GarbageCollection(unsigned int dieNo)
 {
 	unsigned int victimBlockNo, pageNo, virtualSliceAddr, logicalSliceAddr, dieNoForGcCopy, reqSlotTag;
+	unsigned int expCopiedSliceCnt = 0;	/* EXP */
 
 	victimBlockNo = GetFromGcVictimList(dieNo);
 	dieNoForGcCopy = dieNo;
@@ -123,9 +125,16 @@ void GarbageCollection(unsigned int dieNo)
 					virtualSliceMapPtr->virtualSlice[reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr].logicalSliceAddr = logicalSliceAddr;
 
 					SelectLowLevelReqQ(reqSlotTag);
+
+					/* EXP: once per copied slice (counted on the write side only) */
+					expCopiedSliceCnt++;
+					exp_on_gc_copy(BYTES_PER_DATA_REGION_OF_SLICE);
+					exp_on_nand_program(EXP_PROG_GC, BYTES_PER_DATA_REGION_OF_SLICE);
 				}
 		}
 	}
+
+	exp_on_gc_victim_done((exp_u64)expCopiedSliceCnt * BYTES_PER_DATA_REGION_OF_SLICE);	/* EXP: once per victim */
 
 	EraseBlock(dieNo, victimBlockNo);
 }

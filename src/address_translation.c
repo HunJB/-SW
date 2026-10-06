@@ -48,6 +48,7 @@
 #include <assert.h>
 #include "memory_map.h"
 #include "xil_printf.h"
+#include "exp_stat.h"	/* EXP */
 
 P_LOGICAL_SLICE_MAP logicalSliceMapPtr;
 P_VIRTUAL_SLICE_MAP virtualSliceMapPtr;
@@ -796,6 +797,8 @@ void EraseBlock(unsigned int dieNo, unsigned int blockNo)
 	reqPoolPtr->reqPool[reqSlotTag].nandInfo.programmedPageCnt = virtualBlockMapPtr->block[dieNo][blockNo].currentPage;
 
 	SelectLowLevelReqQ(reqSlotTag);
+
+	exp_on_erase(1);	/* EXP: erase requested by GC. Boot-time erase uses another function and is not counted */
 
 	// block map indicated blockNo initialization
 	virtualBlockMapPtr->block[dieNo][blockNo].free = 1;

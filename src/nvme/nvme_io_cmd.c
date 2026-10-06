@@ -60,6 +60,8 @@
 
 #include "../ftl_config.h"
 #include "../request_transform.h"
+#include "../address_translation.h"	/* EXP */
+#include "../exp_stat.h"				/* EXP */
 
 void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 {
@@ -110,7 +112,88 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0);
 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
 
+	exp_on_host_write((exp_u64)(nlb + 1) * BYTES_PER_NVME_BLOCK);	/* EXP: once per write command */
+
 	ReqTransNvmeToSlice(cmdSlotTag, startLba[0], nlb, IO_NVM_WRITE);
+}
+
+/* EXP: minimal Dataset Management (Deallocate) support
+ *  - The range list (up to 256 ranges x 16 bytes = 4KB) is fetched with direct DMA.
+ *  - Only slices (16KB) fully covered by a range are invalidated.
+ *    LBAs that only partly cover a slice are ignored and counted.
+ *  - Unmapping reuses InvalidateOldVsa(), the same path an overwrite takes.
+ *  - Dirty entries left in the data buffer are not touched (at most 2MB; known limit).
+ */
+void handle_nvme_io_dataset_management(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
+{
+	DATASET_MANAGEMENT_RANGE *range;
+	NVME_COMPLETION nvmeCPL;
+	unsigned int nr, ad, i, len, firstLen;
+	unsigned int slba, nlb, firstSlice, endSlice, lsa, fullBlocks;
+	exp_u64 reqBytes = 0;
+
+	exp_dsm_begin();
+
+	nr = (nvmeIOCmd->dword10 & 0xFF) + 1;
+	ad = (nvmeIOCmd->dword11 >> 2) & 0x1;
+	len = nr * sizeof(DATASET_MANAGEMENT_RANGE);
+
+	if(ad && ((nvmeIOCmd->PRP1[0] & 0x3) == 0))
+	{
+		firstLen = 0x1000 - (nvmeIOCmd->PRP1[0] & 0xFFF);
+		if(len <= firstLen)
+			set_direct_rx_dma(ADMIN_CMD_DRAM_DATA_BUFFER, nvmeIOCmd->PRP1[1], nvmeIOCmd->PRP1[0], len);
+		else
+		{
+			set_direct_rx_dma(ADMIN_CMD_DRAM_DATA_BUFFER, nvmeIOCmd->PRP1[1], nvmeIOCmd->PRP1[0], firstLen);
+			set_direct_rx_dma(ADMIN_CMD_DRAM_DATA_BUFFER + firstLen, nvmeIOCmd->PRP2[1], nvmeIOCmd->PRP2[0], len - firstLen);
+		}
+		check_direct_rx_dma_done();
+
+		range = (DATASET_MANAGEMENT_RANGE *)ADMIN_CMD_DRAM_DATA_BUFFER;
+		for(i = 0; i < nr; i++)
+		{
+			slba = range[i].startingLBA[0];
+			nlb = range[i].lengthInLogicalBlocks;
+			reqBytes += (exp_u64)nlb * BYTES_PER_NVME_BLOCK;
+
+			//a range outside the capacity is ignored as a whole
+			if((range[i].startingLBA[1] != 0) || (slba >= storageCapacity_L) || (nlb > storageCapacity_L - slba))
+			{
+				exp_on_dsm_ignored((exp_u64)nlb * BYTES_PER_NVME_BLOCK);
+				continue;
+			}
+
+			firstSlice = (slba + NVME_BLOCKS_PER_SLICE - 1) / NVME_BLOCKS_PER_SLICE;
+			endSlice = (slba + nlb) / NVME_BLOCKS_PER_SLICE;	//exclusive
+			fullBlocks = (endSlice > firstSlice) ? (endSlice - firstSlice) * NVME_BLOCKS_PER_SLICE : 0;
+			exp_on_dsm_ignored((exp_u64)(nlb - fullBlocks) * BYTES_PER_NVME_BLOCK);
+
+			for(lsa = firstSlice; lsa < endSlice; lsa++)
+			{
+				if(logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == VSA_NONE)
+				{
+					exp_on_dsm_already_free(BYTES_PER_DATA_REGION_OF_SLICE);
+					continue;
+				}
+
+				InvalidateOldVsa(lsa);
+
+				if(logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr == VSA_NONE)
+					exp_on_dsm_invalidated(BYTES_PER_DATA_REGION_OF_SLICE);
+				else
+					exp_on_dsm_ignored(BYTES_PER_DATA_REGION_OF_SLICE);
+			}
+		}
+	}
+
+	exp_on_dsm_cmd(nr, reqBytes);
+
+	nvmeCPL.dword[0] = 0;
+	nvmeCPL.specific = 0x0;
+	set_auto_nvme_cpl(cmdSlotTag, nvmeCPL.specific, nvmeCPL.statusFieldWord);
+
+	exp_dsm_end();
 }
 
 void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
@@ -150,6 +233,11 @@ void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
 		{
 //			xil_printf("IO Read Command\r\n");
 			handle_nvme_io_read(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		case IO_NVM_DATASET_MANAGEMENT:	/* EXP */
+		{
+			handle_nvme_io_dataset_management(nvmeCmd->cmdSlotTag, nvmeIOCmd);
 			break;
 		}
 		default:
