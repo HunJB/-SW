@@ -1,13 +1,14 @@
 /*
  * exp_stat.c
- * Cosmos+ OpenSSD 펌웨어용 실험 계측 모듈 구현
+ * Measurement counters for the Cosmos+ OpenSSD firmware
  *
- * Zynq-7000 standalone BSP 기준
- *  - 시간: xtime_l.h 의 XTime_GetTime() (Cortex-A9 global timer)
- *  - 출력: xil_printf. xil_printf는 %llu 를 지원하지 않으므로
- *          64비트 값은 직접 10진 문자열로 바꿔 %s 로 출력한다.
+ * Zynq-7000 standalone BSP
+ *  - time  : XTime_GetTime() from xtime_l.h (Cortex-A9 global timer)
+ *  - output: xil_printf has no %llu, so 64-bit values are converted to
+ *            decimal strings here and printed with %s.
  *
- * PC에서 컴파일 검사만 할 때는 -DEXP_STAT_HOST_TEST 로 빌드한다.
+ * Build with -DEXP_STAT_HOST_TEST to compile-check on a PC.
+ * Comments are kept in ASCII so editors on Windows/Linux do not garble them.
  */
 #include "exp_stat.h"
 
@@ -34,7 +35,7 @@ static XTime s_last_print;
 static XTime s_dsm_start;
 static int   s_dsm_active;
 
-/* ---------- 내부 도우미 ---------- */
+/* ---------- helpers ---------- */
 
 static void u64_to_dec(exp_u64 v, char *buf)
 {
@@ -67,7 +68,7 @@ static void zero_counters(void)
     unsigned char *p = (unsigned char *)&g_exp_stat;
     unsigned int i;
     exp_u64 epoch = g_exp_stat.epoch;
-    exp_u64 seq = g_exp_stat.dump_seq;   /* 일련번호는 리셋해도 이어지게 */
+    exp_u64 seq = g_exp_stat.dump_seq;   /* keep the sequence number across resets */
 
     for (i = 0; i < sizeof(g_exp_stat); i++)
         p[i] = 0;
@@ -75,7 +76,7 @@ static void zero_counters(void)
     g_exp_stat.epoch = epoch;
 }
 
-/* ---------- 공개 함수 ---------- */
+/* ---------- public ---------- */
 
 void exp_stat_init(void)
 {
@@ -95,9 +96,9 @@ void exp_stat_reset(void)
 }
 
 /*
- * 출력 형식 (한 줄):
+ * Output format (one line):
  *   EXPSTAT,tag=MARK,seq=3,tick=...,cps=...,host_wr_B=...,...
- * 호스트에서 parse_expstat.py 로 CSV로 바꾼다.
+ * tools/parse_expstat.py turns it into CSV on the host.
  */
 void exp_stat_dump(const char *tag)
 {
@@ -108,7 +109,7 @@ void exp_stat_dump(const char *tag)
     s->dump_seq++;
 
     xil_printf("\r\nEXPSTAT,tag=%s", tag);
-    xil_printf(",schema=2,basis=request_issue,dsm_supported=1,erase_completion_tracked=0");
+    xil_printf(",schema=3,snapshot_opc=0xC2,basis=request_issue,dsm_supported=1,erase_completion_tracked=0");
     print_kv("epoch", s->epoch);
     print_kv("seq", s->dump_seq);
     print_kv("tick", (exp_u64)now);
@@ -156,6 +157,28 @@ void exp_stat_poll(void)
 #endif
 }
 
+exp_u32 exp_stat_snapshot(void *buf)
+{
+    exp_u64 *out = (exp_u64 *)buf;
+    const exp_u64 *src = (const exp_u64 *)&g_exp_stat;
+    unsigned int n = sizeof(g_exp_stat) / sizeof(exp_u64);
+    unsigned int i;
+    XTime now;
+
+    XTime_GetTime(&now);
+    for (i = 0; i < EXP_SNAPSHOT_BYTES / sizeof(exp_u64); i++)
+        out[i] = 0;
+
+    out[0] = EXP_SNAPSHOT_MAGIC;
+    out[1] = (exp_u64)now;
+    out[2] = (exp_u64)COUNTS_PER_SECOND;
+    out[3] = (exp_u64)n;
+    for (i = 0; i < n && (EXP_SNAPSHOT_HEADER_NR + i) < EXP_SNAPSHOT_BYTES / sizeof(exp_u64); i++)
+        out[EXP_SNAPSHOT_HEADER_NR + i] = src[i];
+
+    return (exp_u32)((EXP_SNAPSHOT_HEADER_NR + n) * sizeof(exp_u64));
+}
+
 void exp_stat_on_marker(exp_u32 arg)
 {
     exp_stat_dump("MARK");
@@ -187,5 +210,6 @@ void exp_dsm_end(void)
     g_exp_stat.dsm_ticks_total += d;
     if (d > g_exp_stat.dsm_ticks_max)
         g_exp_stat.dsm_ticks_max = d;
+    g_exp_stat.dsm_hist_ticks[exp_log2_bucket(d, EXP_HIST_TICKS_NR)]++;
     s_dsm_active = 0;
 }

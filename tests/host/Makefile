@@ -9,30 +9,25 @@ CC     ?= gcc
 CFLAGS := -std=gnu99 -O1 -Wall -Wextra -Wno-int-to-pointer-cast -Wno-unused-parameter \
           -Istub -I$(SRC)
 FW     := $(SRC)/nvme/dsm_deallocate.c $(SRC)/exp_stat.c
-# make syntax 대상: 패치가 손댄 파일
+# make syntax 대상: 실험 때문에 손댄 파일
 CHANGED := exp_stat.c nvme/dsm_deallocate.c nvme/nvme_io_cmd.c nvme/nvme_admin_cmd.c \
-           nvme/nvme_identify.c nvme/nvme_main.c garbage_collection.c address_translation.c \
-           request_transform.c
+           nvme/nvme_identify.c nvme/nvme_main.c garbage_collection.c request_schedule.c \
+           data_buffer.c
 
 .PHONY: test syntax clean
 
-test: build/test_direct build/test_auto
-	./build/test_direct build/before.bin build/after.bin
-	./build/test_auto
+test: build/test_dsm
+	./build/test_dsm build/before.bin build/after.bin
 	python3 $(TOOLS)/parse_expstat.py --selftest build/before.bin build/after.bin
 	@echo "PC 시험 통과"
 
-build/test_direct: test_dsm.c $(FW) $(SRC)/exp_stat.h $(SRC)/nvme/dsm_deallocate.h
+build/test_dsm: test_dsm.c $(FW) $(SRC)/exp_stat.h $(SRC)/nvme/dsm_deallocate.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ test_dsm.c $(FW)
 
-build/test_auto: test_dsm.c $(FW) $(SRC)/exp_stat.h $(SRC)/nvme/dsm_deallocate.h
-	@mkdir -p build
-	$(CC) $(CFLAGS) -DDSM_PAYLOAD_USE_AUTO_DMA=1 -o $@ test_dsm.c $(FW)
-
 syntax:
 	@for f in $(CHANGED); do \
-		$(CC) $(CFLAGS) -w -fsyntax-only -I$(SRC)/nvme $(SRC)/$$f || exit 1; \
+		$(CC) $(CFLAGS) -w -fsyntax-only -include stdint.h -I$(SRC)/nvme $(SRC)/$$f || exit 1; \
 		echo "ok  $$f"; \
 	done
 

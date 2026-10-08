@@ -8,7 +8,8 @@
   parse_expstat.py --show snap.bin                  # 스냅샷 하나의 누적값
   parse_expstat.py uart.log [--from N --to M]       # UART 로그의 EXPSTAT 줄을 CSV로
 
-필드 순서는 src/exp_stat.h 의 exp_stat_t 와 같아야 한다. tests/host 의 make test 가 이를 검사한다.
+필드 순서는 src/exp_stat.h 의 exp_stat_t, src/nvme/dsm_deallocate.h 의 DSM_STATS 와 같아야 한다.
+tests/host 의 make test 가 이를 검사한다. UART 로그(EXPSTAT,tag=... 줄)도 읽을 수 있다.
 """
 import argparse
 import csv
@@ -16,25 +17,32 @@ import json
 import struct
 import sys
 
-MAGIC_V1 = 0x3154415453505845  # "EXPSTAT1"
-MAGIC_V2 = 0x3254415453505845  # "EXPSTAT2"
+MAGIC = 0x3354415453505845  # "EXPSTAT3"
 HIST_TICKS_NR = 40
 HIST_LBA_NR = 32
+SLICE_BYTES = 16384
 
-SCALAR_FIELDS = [
-    "host_wr_B", "host_wr_cmd", "gc_copy_B", "gc_cnt", "gc_victim_valid_B",
-    "erase_cnt", "erase_fail", "dsm_cmd", "dsm_range", "dsm_req_B",
-    "dsm_inval_B", "dsm_ignored_B", "dsm_already_free_B", "dsm_ticks", "dsm_ticks_max",
-    "prog_host_B", "prog_gc_B", "prog_meta_B", "dsm_nest_err", "seq",
-    # 스냅샷 버전 2에서 추가
-    "dsm_busy_B", "dsm_err",
+# src/exp_stat.h 의 exp_stat_t 순서. 이름은 UART 출력(EXPSTAT 줄)과 같게 맞췄다.
+EXP_FIELDS = [
+    "host_wr_B", "host_wr_cmd", "gc_copy_B", "gc_scheduled", "gc_victim_valid_B",
+    "erase_issued", "erase_cnt", "erase_fail",
+    "dsm_cmd", "dsm_range", "dsm_req_B", "dsm_inval_B", "dsm_ignored_B", "dsm_already_free_B",
+    "dsm_ticks", "dsm_ticks_max",
+    "prog_host_B", "prog_gc_B", "prog_meta_B",
+    "dsm_nest_err", "epoch", "seq",
+] + [f"hist_ticks_{i}" for i in range(HIST_TICKS_NR)] + [f"hist_lba_{i}" for i in range(HIST_LBA_NR)]
+
+# src/nvme/dsm_deallocate.h 의 DSM_STATS 순서
+DSM_FIELDS = [
+    "dsm_s_cmd", "dsm_s_range", "dsm_s_merged_range", "dsm_s_req_B",
+    "dsm_s_inval_slices", "dsm_s_inval_B", "dsm_s_unmapped_slices", "dsm_s_ignored_B",
+    "dsm_busy_slices", "dsm_clean_evict_slices", "dsm_gc_busy_cmds",
+    "dsm_bad_nsid_cmds", "dsm_oor_ranges", "dsm_errors", "dsm_s_ticks",
 ]
-V1_FIELD_NR = 20
-FIELDS = (SCALAR_FIELDS
-          + [f"hist_ticks_{i}" for i in range(HIST_TICKS_NR)]
-          + [f"hist_lba_{i}" for i in range(HIST_LBA_NR)])
+FIELDS = EXP_FIELDS + DSM_FIELDS
+SCALAR_FIELDS = [f for f in FIELDS if not f.startswith("hist_")]
 # 차이를 내지 않는 항목
-NOT_CUMULATIVE = ("seq", "dsm_ticks_max", "cps")
+NOT_CUMULATIVE = ("seq", "epoch", "dsm_ticks_max", "cps")
 
 
 def read_bin(path):
@@ -42,20 +50,23 @@ def read_bin(path):
     if len(data) < 32:
         sys.exit(f"{path}: 크기가 너무 작습니다 ({len(data)} 바이트)")
     magic, tick, cps, n = struct.unpack("<4Q", data[:32])
-    if magic == MAGIC_V1:
-        n, off = V1_FIELD_NR, 24
-    elif magic == MAGIC_V2:
-        off = 32
-        if n != len(FIELDS):
-            sys.exit(f"{path}: 펌웨어의 필드 수({n})와 이 스크립트의 필드 수({len(FIELDS)})가 다릅니다. "
-                     "exp_stat.h 와 parse_expstat.py 의 버전을 맞추세요.")
-    else:
-        sys.exit(f"{path}: EXPSTAT 스냅샷이 아닙니다 (펌웨어가 0xC2 명령을 처리하지 않았을 수 있음)")
-    if len(data) < off + n * 8:
-        sys.exit(f"{path}: 내용이 잘렸습니다")
+    if magic != MAGIC:
+        sys.exit(f"{path}: EXPSTAT3 스냅샷이 아닙니다 (magic=0x{magic:x}). "
+                 "펌웨어가 0xC2 명령을 처리하지 않거나 다른 버전입니다.")
+    if n != len(EXP_FIELDS):
+        sys.exit(f"{path}: exp_stat 필드 수가 다릅니다 (펌웨어 {n}, 스크립트 {len(EXP_FIELDS)}). "
+                 "src/exp_stat.h 와 tools/parse_expstat.py 를 같은 버전으로 맞추세요.")
+    off = 32
+    vals = struct.unpack(f"<{n}Q", data[off:off + n * 8])
+    off += n * 8
+    (nd,) = struct.unpack("<Q", data[off:off + 8])
+    off += 8
+    if nd != len(DSM_FIELDS):
+        sys.exit(f"{path}: DSM 통계 필드 수가 다릅니다 (펌웨어 {nd}, 스크립트 {len(DSM_FIELDS)}).")
+    dvals = struct.unpack(f"<{nd}Q", data[off:off + nd * 8])
     row = {"tick": tick, "cps": cps}
-    row.update({k: 0 for k in FIELDS})
-    row.update(dict(zip(FIELDS, struct.unpack(f"<{n}Q", data[off:off + n * 8]))))
+    row.update(dict(zip(EXP_FIELDS, vals)))
+    row.update(dict(zip(DSM_FIELDS, dvals)))
     return row
 
 
@@ -90,7 +101,8 @@ def summarize(ra, rb):
     d = diff(ra, rb)
     out = {k: v for k, v in d.items() if not k.startswith("hist_")}
     out["seconds"] = d["tick"] / cps
-    out["rebooted"] = any(v < 0 for v in d.values())
+    out["rebooted"] = any(v < 0 for v in d.values()) or int(ra.get("epoch", 0)) != int(rb.get("epoch", 0))
+    out["dsm_busy_B"] = d.get("dsm_busy_slices", 0) * SLICE_BYTES
     out["dsm_ticks_max_abs"] = int(rb.get("dsm_ticks_max", 0))
 
     host = d.get("host_wr_B", 0)
@@ -125,11 +137,14 @@ def report(ra, rb):
     s = summarize(ra, rb)
     cps = int(rb["cps"])
     if s["rebooted"]:
-        print("주의: 값이 줄어든 항목이 있습니다. 두 시점 사이에 보드가 재부팅됐을 수 있습니다.")
+        print("주의: 값이 줄었거나 epoch가 바뀌었습니다. 두 시점 사이에 보드가 재부팅됐거나 리셋 명령이 있었습니다.")
     print(f"구간 길이: {s['seconds']:.1f} 초")
     for k in SCALAR_FIELDS:
         if k in s:
             print(f"  {k:22s} {s[k]}")
+    print(f"  {'dsm_busy_B':22s} {s['dsm_busy_B']}  (dirty buffer 때문에 건너뛴 양, dsm_ignored_B 에 포함)")
+    if s.get("dsm_gc_busy_cmds"):
+        print(f"주의: GC 복사가 진행 중이라 통째로 적용되지 않은 DSM 명령 {s['dsm_gc_busy_cmds']}개")
     if "gc_copy_ratio" in s:
         print(f"GC 복사 비율  gc_copy/host   = {s['gc_copy_ratio']:.3f}")
         print(f"장치 WAF      program/host   = {s['device_waf']:.3f}")
@@ -165,12 +180,17 @@ def parse_uart(path):
 
 
 def selftest(a, b):
-    """tests/host 가 만든 스냅샷 두 개로 필드 순서를 확인한다. i번째 필드의 차이는 7*(i+1)."""
+    """tests/host 가 만든 스냅샷 두 개로 필드 순서를 확인한다.
+    각 구역의 i번째 필드는 1000+i, 두 번째 파일에서는 7*(i+1) 만큼 크다."""
     ra, rb = read_bin(a), read_bin(b)
-    bad = [k for i, k in enumerate(FIELDS) if int(rb[k]) - int(ra[k]) != 7 * (i + 1) or int(ra[k]) != 1000 + i]
+    bad = []
+    for names in (EXP_FIELDS, DSM_FIELDS):
+        for i, k in enumerate(names):
+            if int(ra[k]) != 1000 + i or int(rb[k]) - int(ra[k]) != 7 * (i + 1):
+                bad.append(k)
     if bad:
         sys.exit(f"필드 순서 불일치: {bad[:5]}")
-    print(f"parse_expstat.py: {len(FIELDS)}개 필드 순서 일치")
+    print(f"parse_expstat.py: exp_stat {len(EXP_FIELDS)}개, DSM {len(DSM_FIELDS)}개 필드 순서 일치")
 
 
 def main():

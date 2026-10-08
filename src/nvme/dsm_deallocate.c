@@ -535,6 +535,23 @@ void DsmResetStats(void)
         p[i] = 0;
 }
 
+unsigned int DsmSnapshot(void *buf, unsigned int maxBytes)
+{
+    unsigned long long *out = (unsigned long long *)buf;
+    const unsigned long long *src = (const unsigned long long *)&dsmStats;
+    unsigned int n = sizeof(dsmStats) / sizeof(unsigned long long);
+    unsigned int i;
+
+    if (maxBytes < (n + 1) * sizeof(unsigned long long))
+        return 0;
+
+    out[0] = n;
+    for (i = 0; i < n; i++)
+        out[1 + i] = src[i];
+
+    return (n + 1) * sizeof(unsigned long long);
+}
+
 #define DSM_PRINT64(name, value) \
     xil_printf("DSM %s = %u%09u\r\n", \
         (name), \

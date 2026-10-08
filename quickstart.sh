@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# quickstart.sh — exp-stat 펌웨어를 올린 Cosmos+ 보드를 터미널에서 단계별로 점검한다.
+# quickstart.sh — 저장소 src 로 빌드한 펌웨어를 올린 Cosmos+ 보드를 터미널에서 단계별로 점검한다.
 #
 # 사용법:
 #   sudo ./quickstart.sh                 # 1단계부터 차례로
@@ -10,7 +10,7 @@
 #   1 필요한 프로그램 확인
 #   2 PC 시험 (보드를 쓰지 않음)
 #   3 실험 장치 찾기와 확인
-#   4 펌웨어 확인 (이 브랜치의 펌웨어가 올라가 있는지)
+#   4 펌웨어 확인 (schema=3 계측 펌웨어가 올라가 있는지)
 #   5 펌웨어 검증 fw_verify.sh (장치 앞쪽 약 1.6GiB를 덮어씀)
 #   6 짧은 실험 한 번 (W1, batch, 4 cycle. 장치를 포맷하고 용량의 약 1.3배를 씀)
 #
@@ -91,14 +91,15 @@ if [ "$FROM" -le 4 ]; then
     disc_max=$(lsblk -dbno DISC-MAX "$DEV" | tr -d ' ')
     echo "ONCS=$oncs (4의 자리 비트가 Dataset Management 지원), DISC-MAX=$disc_max"
     if ! (( oncs & 0x4 )) || [ "$disc_max" = "0" ]; then
-        die "이 보드는 discard 지원을 표시하지 않습니다. exp-stat 브랜치의 src 로 빌드한 펌웨어가 아닙니다.
+        die "이 보드는 discard 지원을 표시하지 않습니다. 저장소의 src 로 빌드한 펌웨어가 아닙니다.
        이 상태에서는 5·6단계를 실행하면 안 됩니다. 펌웨어를 다시 올린 뒤 실행하세요."
     fi
     echo "discard 지원 표시 확인"
     echo
-    echo "UART 창에 부팅 때 'EXPSTAT,tag=BOOT' 줄이 한 번 찍혔고,"
-    echo "'tag=PERIOD' 줄이 주기적으로 나오지 않는 것이 이 브랜치의 펌웨어입니다."
-    ask "UART에서 그렇게 확인했습니까?" || die "다른 계측 펌웨어일 수 있습니다. 벤더 명령 형식이 달라 진행하지 않습니다"
+    echo "UART 창의 부팅 줄이 'EXPSTAT,tag=BOOT,schema=3,snapshot_opc=0xC2,...' 로 시작해야"
+    echo "호스트가 카운터를 읽을 수 있는 펌웨어입니다. schema=2 이하는 이전 버전이라 5·6단계에서 보드가 멈춥니다."
+    ask "UART에서 schema=3 을 확인했습니까?" || die "schema=3 펌웨어가 아닙니다. 저장소의 최신 src 로 다시 빌드해 올리세요"
+    export ASSUME_SCHEMA3=1
 fi
 
 # ---------- 5 ----------
@@ -128,7 +129,8 @@ if ask "지금 실행할까요?"; then
     echo "실험 소요: $(( $(date +%s) - start ))초"
     last=$(ls -dt "$HERE"/ssd_discard_experiment/runs/w1_batch_rep0_* | head -1)
     echo "결과 폴더: $last"
-    echo "summary.json 의 verdict 가 valid 이고 gc_copy_bytes, dsm_invalid_bytes 가 0보다 크면 정상입니다."
+    echo "summary.json 의 verdict 가 valid 이고 dsm_invalid_bytes 가 0보다 크면 정상입니다."
+    echo "(4 cycle은 짧아서 GC가 아직 시작되지 않았을 수 있습니다. gc_copy_bytes 0은 이 단계에선 문제가 아닙니다.)"
 else
     echo "건너뜀. 나중에: sudo ./quickstart.sh --from 6"
 fi
