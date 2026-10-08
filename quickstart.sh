@@ -5,17 +5,21 @@
 #   sudo ./quickstart.sh                 # 1단계부터 차례로
 #   sudo ./quickstart.sh --from 4        # 4단계부터 (장치 확인은 항상 다시 함)
 #   sudo EXPECTED_SERIAL=<시리얼> ./quickstart.sh   # 장치를 묻지 않고 시리얼로 지정
+#   sudo UART_LOG=<파일> ./quickstart.sh            # UART를 이 PC에서 받고 있을 때. 카운터 판정까지 바로 함
+#
+# 카운터는 펌웨어가 10초마다 UART로 내보내는 EXPSTAT,tag=PERIOD 줄에서 읽는다.
+# 시작 전에 UART가 연결된 PC에서 tools/uart_capture.py 로 로그를 받기 시작해 둔다.
 #
 # 단계
 #   1 필요한 프로그램 확인
 #   2 PC 시험 (보드를 쓰지 않음)
 #   3 실험 장치 찾기와 확인
-#   4 펌웨어 확인 (schema=3 계측 펌웨어가 올라가 있는지)
+#   4 펌웨어 확인 (discard 지원 표시, UART 주기 출력과 로그 수집)
 #   5 펌웨어 검증 fw_verify.sh (장치 앞쪽 약 1.6GiB를 덮어씀)
 #   6 짧은 실험 한 번 (W1, batch, 4 cycle. 장치를 포맷하고 용량의 약 1.3배를 씀)
 #
 # 3단계 전까지는 보드에 아무 명령도 보내지 않는다.
-# 4단계를 통과하기 전에는 보드에 쓰기·discard·벤더 명령을 보내지 않는다.
+# 4단계를 통과하기 전에는 보드에 쓰기나 discard를 보내지 않는다.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -96,10 +100,14 @@ if [ "$FROM" -le 4 ]; then
     fi
     echo "discard 지원 표시 확인"
     echo
-    echo "UART 창의 부팅 줄이 'EXPSTAT,tag=BOOT,schema=3,snapshot_opc=0xC2,...' 로 시작해야"
-    echo "호스트가 카운터를 읽을 수 있는 펌웨어입니다. schema=2 이하는 이전 버전이라 5·6단계에서 보드가 멈춥니다."
-    ask "UART에서 schema=3 을 확인했습니까?" || die "schema=3 펌웨어가 아닙니다. 저장소의 최신 src 로 다시 빌드해 올리세요"
-    export ASSUME_SCHEMA3=1
+    echo "카운터는 UART로만 나옵니다. 다음을 확인하세요."
+    echo "  - UART에 'EXPSTAT,tag=PERIOD,schema=2,...' 줄이 약 10초마다 찍힌다"
+    echo "  - UART가 연결된 PC에서 uart_capture.py 로 그 출력을 파일에 받고 있다"
+    echo "      sudo python3 tools/uart_capture.py /dev/ttyUSB<번호> ~/uart.log"
+    echo "    (SDK 터미널 등 같은 포트를 연 프로그램은 먼저 닫는다)"
+    echo "  - 두 PC의 시계가 맞다: 양쪽에서 timedatectl → System clock synchronized: yes"
+    ask "모두 확인했습니까?" || die "UART 로그 수집을 먼저 준비하세요"
+    export ASSUME_UART_OK=1
 fi
 
 # ---------- 5 ----------
@@ -113,6 +121,10 @@ if [ "$FROM" -le 5 ]; then
         die "검증 실패. 위 출력과 UART 마지막 줄, $HOME/quickstart_dmesg_*.txt 를 보내 주세요"
     }
     echo "검증 소요: $(( $(date +%s) - start ))초"
+    if [ -z "${UART_LOG:-}" ]; then
+        echo "카운터 판정은 UART 로그를 이 PC로 가져온 뒤:"
+        echo "  python3 $HERE/tools/parse_expstat.py --check <fw_verify 결과 폴더> <uart.log>"
+    fi
 fi
 
 # ---------- 6 ----------
@@ -129,6 +141,10 @@ if ask "지금 실행할까요?"; then
     echo "실험 소요: $(( $(date +%s) - start ))초"
     last=$(ls -dt "$HERE"/ssd_discard_experiment/runs/w1_batch_rep0_* | head -1)
     echo "결과 폴더: $last"
+    if [ -z "${UART_LOG:-}" ]; then
+        echo "UART 로그를 $last/uart.log 로 복사한 뒤 다음을 실행하면 GC·DSM 수치가 나옵니다:"
+        echo "  python3 $HERE/ssd_discard_experiment/analysis/correlate_and_compute.py $last"
+    fi
     echo "summary.json 의 verdict 가 valid 이고 dsm_invalid_bytes 가 0보다 크면 정상입니다."
     echo "(4 cycle은 짧아서 GC가 아직 시작되지 않았을 수 있습니다. gc_copy_bytes 0은 이 단계에선 문제가 아닙니다.)"
 else
@@ -138,5 +154,5 @@ fi
 echo
 echo "여기까지 통과했으면 본 측정으로 넘어갑니다:"
 echo "  cd $HERE/ssd_discard_experiment/scripts"
-echo "  export EXPECTED_SERIAL=$EXPECTED_SERIAL MNT=$MNT EXPSTAT=1"
+echo "  export EXPECTED_SERIAL=$EXPECTED_SERIAL MNT=$MNT EXPSTAT=1   # UART를 이 PC에서 받으면 UART_LOG=<파일> 도"
 echo "  sudo -E ./run_all.sh poc"

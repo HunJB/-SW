@@ -3,8 +3,11 @@
  * The two firmware files are compiled unchanged; hardware access and the few
  * FTL functions they call are replaced by the stand-ins below. This checks
  * range arithmetic, buffer handling and counters, not DMA or timing on the board.
+ * With a file argument it also writes real exp_stat_dump() output there, so
+ * tools/parse_expstat.py can check it reads every field the firmware prints.
  */
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -34,7 +37,15 @@ static unsigned char hostmem[2 * 4096];	/* PRP1 page, PRP2 page */
 static int cplCnt, dmaCalls, invalCalls;
 static unsigned int lastSC;
 
-void xil_printf(const char *f, ...) { (void)f; }
+static FILE *uartFp;	/* where xil_printf goes (the UART log for the parser check) */
+void xil_printf(const char *f, ...)
+{
+	va_list ap;
+	if (!uartFp) return;
+	va_start(ap, f);
+	vfprintf(uartFp, f, ap);
+	va_end(ap);
+}
 void XTime_GetTime(XTime *t) { static XTime n; *t = n += 1000; }
 void XTime_SetTime(XTime t) { (void)t; }
 
@@ -126,7 +137,6 @@ static int in_hash(unsigned lsa)
 	return 0;
 }
 
-static exp_u64 sum(const exp_u64 *a, unsigned n) { exp_u64 s = 0; while (n--) s += a[n]; return s; }
 #define BALANCED() (S->dsm_req_bytes - rejectedReq == S->dsm_invalid_bytes + S->dsm_already_free_bytes + S->dsm_ignored_bytes)
 
 int main(int argc, char **argv)
@@ -233,36 +243,17 @@ int main(int argc, char **argv)
 	CHK(BALANCED());
 	CHK((exp_u64)cplCnt == S->dsm_cmd_count);
 	CHK(S->dsm_nesting_error == 0); CHK(S->dsm_ticks_total > 0);
-	CHK(sum(S->dsm_hist_ticks, EXP_HIST_TICKS_NR) == S->dsm_cmd_count);
-	CHK(sum(S->dsm_hist_lba, EXP_HIST_LBA_NR) == S->dsm_cmd_count);
-	CHK(exp_log2_bucket(0, 8) == 0); CHK(exp_log2_bucket(2, 8) == 1);
-	CHK(exp_log2_bucket(1024, 32) == 10); CHK(exp_log2_bucket(~0ULL, 8) == 7);
-	CHK(sizeof(exp_stat_t) % 8 == 0); CHK(sizeof(DSM_STATS) % 8 == 0);
+	CHK(D->cmdCount == S->dsm_cmd_count);
+	CHK(D->invalidBytes == S->dsm_invalid_bytes); CHK(D->ignoredBytes == S->dsm_ignored_bytes);
 
-	/* snapshot layout: exp_stat section followed by the DSM section */
-	{
-		static unsigned char buf[EXP_SNAPSHOT_BYTES];
-		unsigned used = exp_stat_snapshot(buf);
-		unsigned more = DsmSnapshot(buf + used, EXP_SNAPSHOT_BYTES - used);
-		CHK(more > 0); CHK(used + more <= EXP_SNAPSHOT_BYTES);
-	}
-
-	/* snapshot files for the parser check: field i of each section holds 1000 + i, then 1000 + i + 7(i + 1) */
-	if (argc == 3) {
-		static unsigned char buf[EXP_SNAPSHOT_BYTES];
-		exp_u64 *e = (exp_u64 *)&g_exp_stat;
-		unsigned long long *d = (unsigned long long *)&dsmStats;
-		unsigned ne = sizeof(exp_stat_t) / 8, nd = sizeof(DSM_STATS) / 8, k, used;
-		const char *path[2] = { argv[1], argv[2] };
-		FILE *fp;
-
-		for (k = 0; k < 2; k++) {
-			for (i = 0; i < ne; i++) e[i] = 1000 + i + k * 7 * (i + 1);
-			for (i = 0; i < nd; i++) d[i] = 1000 + i + k * 7 * (i + 1);
-			used = exp_stat_snapshot(buf);
-			DsmSnapshot(buf + used, EXP_SNAPSHOT_BYTES - used);
-			fp = fopen(path[k], "wb"); fwrite(buf, 1, sizeof buf, fp); fclose(fp);
-		}
+	/* UART output for the parser check: two PERIOD lines with known differences */
+	if (argc == 2) {
+		uartFp = fopen(argv[1], "w");
+		exp_stat_dump("PERIOD");
+		S->host_write_bytes += 1234; S->gc_copy_bytes += 56;
+		exp_stat_dump("PERIOD");
+		fclose(uartFp);
+		uartFp = NULL;
 	}
 
 	printf("%d failure(s)\n", fails);

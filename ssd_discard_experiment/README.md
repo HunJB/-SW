@@ -33,7 +33,8 @@ ssd_discard_experiment/
 저장소의 다른 폴더와의 관계:
 
 - `src/` — Cosmos+ 펌웨어. Deallocate 처리와 카운터(`exp_stat`)가 들어 있다.
-- `tools/parse_expstat.py` — 펌웨어 카운터 스냅샷 해석. `EXPSTAT=1`일 때 이 폴더의 스크립트가 호출한다.
+- `tools/uart_capture.py` — 펌웨어가 UART로 내보내는 카운터를 받은 시각과 함께 저장한다.
+- `tools/parse_expstat.py` — 그 UART 로그 해석. 분석 스크립트가 불러 쓴다.
 - `tools/split_trim.sh` — `split` 정책이 호출한다.
 - `tools/fw_verify.sh` — 실험 전에 펌웨어가 정상인지 확인한다. 통과한 뒤에 이 폴더의 스크립트를 쓴다.
 
@@ -42,9 +43,14 @@ ssd_discard_experiment/
 모든 스크립트는 root로 실행한다. 장치는 시리얼로 지정한다. 보드를 재부팅하면 `/dev/nvme0n1`과 `/dev/nvme1n1`이 바뀔 수 있기 때문이다.
 
 ```bash
+# (UART가 연결된 PC) 실험 내내 UART 로그를 받아 둔다. SDK 터미널 등 같은 포트를 연 프로그램은 닫는다.
+sudo python3 tools/uart_capture.py /dev/ttyUSB<번호> ~/uart.log
+
+# (실험 호스트)
 sudo nvme list            # OpenSSD의 시리얼 확인
 cd ssd_discard_experiment/scripts
 export EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1
+# UART를 이 PC에서 받고 있으면 UART_LOG=~/uart.log 도 export 한다
 
 sudo -E ./run_experiment.sh w1 batch 5 1   # W1, 5 cycle마다 fstrim, 1회차
 sudo -E ./run_all.sh poc                   # W1 × 4정책 × 1회
@@ -55,7 +61,8 @@ sudo -E ./run_all.sh ctrl                  # W3 × 4정책 (대조군)
 python3 ../analysis/aggregate_and_plot.py ../runs --out-dir ../report
 ```
 
-- `EXPSTAT=1`은 계측 펌웨어를 올린 Cosmos+ 보드에서만 쓴다. 원본 펌웨어는 모르는 admin 명령을 받으면 멈춘다.
+- `EXPSTAT=1`은 계측 펌웨어를 올린 Cosmos+ 보드에서 쓴다. 측정 시작·끝과 cycle 끝마다 13초(`CP_WAIT`)씩 쉬면서 그 사이에 찍힌 UART `PERIOD` 줄을 기준점으로 삼는다. 보드에 명령을 따로 보내지는 않는다.
+- UART 로그를 다른 PC에서 받았다면, 실험이 끝난 뒤 그 파일을 각 실행 폴더에 `uart.log`로 복사하고 `python3 ../analysis/correlate_and_compute.py <실행 폴더>`를 다시 돌린다. 여러 실행을 한 파일로 받아도 된다. 두 PC의 시계가 맞아 있어야 한다(`timedatectl`).
 - FEMU에서는 `EXPSTAT`을 빼고, 시리얼이 없으면 `DEV=/dev/nvme0n1`처럼 장치를 직접 준다(이때는 포맷 전에 확인을 묻는다). 실행 뒤 FEMU 로그를 실행 폴더에 복사해 분석을 다시 돌린다(`femu_patch/README_PATCH.md`).
 - `run_all.sh`는 실행마다 멈춰서 보드를 재부팅할 시간을 준다. Cosmos+는 재부팅하면 FTL이 빈 상태로 돌아가므로 모든 실행이 같은 상태에서 시작한다.
 
@@ -75,8 +82,9 @@ python3 ../analysis/aggregate_and_plot.py ../runs --out-dir ../report
 | --- | --- |
 | `manifest.json` | 설정값, 장치 시리얼, 마운트 옵션, 커널·fio 버전 |
 | `host_events.csv` | 파일 생성·삭제·TRIM·cycle 시각과 파일이 차지한 장치 범위 |
-| `expstat_start/c<N>/end.bin` | 펌웨어 카운터 스냅샷 (측정 시작, cycle마다, 끝) |
+| `uart.log` | 펌웨어 UART 출력 (복사해 넣은 것) |
 | `expstat_summary.json` | 측정 구간의 카운터 차이, WAF, DSM 처리 시간 |
+| `cycles.csv` | cycle별 카운터 차이 (GC 복사량, 무효화량 등의 시간 흐름) |
 | `fio_probe.json`, `probe_lat.1.log` | 배경 읽기 probe의 지연 |
 | `fstrim_output.log` | fstrim이 보고한 TRIM 양 |
 | `summary.json` | 위를 모은 한 실행의 요약. `verdict`가 `valid`가 아니면 그 실행은 버린다 |
@@ -87,5 +95,6 @@ python3 ../analysis/aggregate_and_plot.py ../runs --out-dir ../report
 
 - 스크립트는 대상 장치를 포맷한다. `/`나 `/boot`가 올라가 있는 디스크는 거부하지만, 시리얼을 직접 확인하고 실행한다.
 - 결과는 저장소 안의 `runs/`에 쌓인다(git에는 올리지 않음). 실험 장치의 마운트 지점 아래에 두지 않는다.
+- 펌웨어는 UART 한 줄을 내보내는 동안(약 40ms) 멈춘다. 10초마다 일어나므로 읽기 지연에 섞일 수 있어, `summary.json`의 `latency_ns.without_uart_stall`에 그 앞뒤 0.25초 표본을 뺀 값을 따로 둔다.
 - 삭제된 데이터의 복사량(`dead_copy_*`)은 FEMU 이벤트 로그가 있을 때만 계산된다. 보드는 합계 카운터만 남기므로 보드 실험의 주 지표는 GC 복사량과 nodiscard 대비 감소율이다.
 - 정책 간 TRIM 총량이 같다고 가정하지 않는다. `summary.json`의 `dsm_req_bytes`, `dsm_invalid_bytes`로 실제 전달량을 함께 본다.

@@ -4,8 +4,17 @@
 #
 # 사용법: sudo DEV=/dev/nvme1n1 EXPECTED_SERIAL=보드시리얼 ./fw_verify.sh
 #
-# 단계 (하나라도 실패하면 거기서 멈춘다)
-#   T0 장치 확인, discard 지원 표시, 카운터 스냅샷
+# 카운터는 펌웨어가 10초마다 UART로 내보내는 EXPSTAT,tag=PERIOD 줄에서 읽는다.
+#   - 실행 중에는 데이터 내용 검사(T3~T5)만 바로 판정하고, 카운터 기대값은 expect.csv 에 적어 둔다.
+#   - 카운터를 확인할 시점마다 13초 동안 아무것도 하지 않고 기다린다. 그 사이에 PERIOD 줄이
+#     하나 찍혀 그 시점의 값이 된다 (checkpoints.csv 에 시각을 남긴다).
+#   - 끝난 뒤 UART 로그(tools/uart_capture.py 로 받은 것)로 판정한다:
+#       python3 tools/parse_expstat.py --check <결과 폴더> <uart.log>
+#     UART를 이 PC에서 받고 있다면 UART_LOG=<그 파일> 을 주면 끝에서 바로 판정한다.
+#   - UART를 받는 PC와 이 PC의 시계가 맞아 있어야 한다 (timedatectl).
+#
+# 단계 (데이터 검사가 하나라도 실패하면 거기서 멈춘다)
+#   T0 장치 확인, discard 지원 표시
 #   T1 쓰기 카운터: 쓴 양과 host_wr_B 가 같은지
 #   T2 Deallocate 기본: 쓴 범위를 discard 하면 그만큼 무효화되고, 다시 하면 변화가 없는지.
 #      방금 써서 data buffer에 남은 범위는 건너뛰는지
@@ -13,7 +22,7 @@
 #   T4 데이터 보존: discard 하지 않은 범위는 그대로이고, discard 한 범위에 다시 쓰면 읽히는지
 #   T5 동시성: 쓰기·검증이 도는 동안 다른 범위에 쓰기와 discard 를 반복해도 문제가 없는지
 #
-# 결과: $OUT/report.txt, 단계별 스냅샷 *.bin
+# 결과: $OUT/report.txt, checkpoints.csv, expect.csv, (판정 뒤) counter_check.txt
 set -euo pipefail
 
 DEV=${DEV:?DEV를 지정하세요 (예: /dev/nvme1n1)}
@@ -22,6 +31,8 @@ OUT=${OUT:-$HOME/exp/fw_verify_$(date +%Y%m%d_%H%M%S)}
 T5_LOOPS=${T5_LOOPS:-3}          # T5에서 쓰기·검증을 반복하는 횟수
 CMD_TIMEOUT=${CMD_TIMEOUT:-300}  # 명령 하나가 이 시간(초) 안에 끝나지 않으면 보드가 멈춘 것으로 본다
 DIRECT=${DIRECT:-1}              # 0은 시험용(파일을 장치 대신 쓸 때)
+CP_WAIT=${CP_WAIT:-13}           # 카운터 시점마다 기다리는 시간(초). PERIOD 주기(10초) + 시계 차이 여유
+UART_LOG=${UART_LOG:-}           # 이 PC에서 받고 있는 UART 로그. 있으면 끝에서 바로 판정
 HERE=$(cd "$(dirname "$0")" && pwd)
 PARSE="$HERE/parse_expstat.py"
 
@@ -42,13 +53,18 @@ if [[ "$DIRECT" == "1" ]]; then OD="oflag=direct"; ID="iflag=direct"; FD="--dire
 run() {   # 멈춘 보드에서 스크립트가 끝없이 기다리지 않도록 시간 제한을 둔다
   timeout "$CMD_TIMEOUT" "$@" || fail "명령 실패 또는 ${CMD_TIMEOUT}초 초과: $*"
 }
-snap() {  # $1 = 이름
-  timeout 30 nvme admin-passthru "$DEV" --opcode=0xC2 --data-len=4096 --read --raw-binary \
-      > "$OUT/$1.bin" 2> "$OUT/$1.err" || fail "스냅샷 명령(0xC2) 실패: $OUT/$1.err"
+echo "name,epoch_ns,idle_until_ns" > "$OUT/checkpoints.csv"
+echo "label,from,to,field,op,value" > "$OUT/expect.csv"
+cp_mark() {  # $1 = 시점 이름. 기록한 뒤 CP_WAIT 초 동안 아무것도 하지 않는다
+  sync
+  local t; t=$(date +%s%N)
+  echo "$1,$t,$(( t + CP_WAIT * 1000000000 ))" >> "$OUT/checkpoints.csv"
+  sleep "$CP_WAIT"
 }
-delta() { # $1 = 시작 스냅샷, $2 = 끝 스냅샷, $3 = 항목
-  python3 "$PARSE" --bin "$OUT/$1.bin" "$OUT/$2.bin" --json \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$3"
+want() {     # $1 = 설명, $2 = 시작 시점, $3 = 끝 시점, $4 = 항목, $5 = eq|ge, $6 = 값
+  echo "$1,$2,$3,$4,$5,$6" >> "$OUT/expect.csv"
+  local sign="="; [[ "$5" == "ge" ]] && sign="≥"
+  say "      기록 $1: $4 $sign $6 (UART 로그로 판정)"
 }
 expect() { # $1 = 설명, $2 = 실제, $3 = 기대
   if [[ "$2" == "$3" ]]; then say "      ok   $1 = $2"; else fail "$1: 실제 $2, 기대 $3"; fi
@@ -76,48 +92,44 @@ oncs=$(nvme id-ctrl "$DEV" -o json | python3 -c 'import json,sys; print(json.loa
 (( oncs & 0x4 )) || fail "장치가 Dataset Management 지원을 표시하지 않음 (ONCS=$oncs). 패치한 펌웨어가 아님"
 disc_max=$(lsblk -dbno DISC-MAX "$DEV" | tr -d ' ')
 [[ "$disc_max" != "0" ]] || fail "커널이 discard를 켜지 않음 (DISC-MAX=0)"
-# 스냅샷 명령(0xC2)은 schema=3 펌웨어에만 있다. 이전 펌웨어는 모르는 admin 명령을 받으면 멈춘다.
-if [[ "${ASSUME_SCHEMA3:-0}" != "1" ]]; then
-  echo "UART의 BOOT 줄에 'schema=3' 이 보여야 합니다 (예: EXPSTAT,tag=BOOT,schema=3,snapshot_opc=0xC2,...)."
-  read -r -p "확인했으면 yes 입력: " ans
-  [[ "$ans" == "yes" ]] || fail "schema=3 펌웨어가 확인되지 않아 중단 (이전 펌웨어에 0xC2를 보내면 보드가 멈춤)"
+if [[ "${ASSUME_UART_OK:-0}" != "1" ]]; then
+  echo "UART에 'EXPSTAT,tag=PERIOD,schema=2,...' 줄이 약 10초마다 찍히고 있어야 하고,"
+  echo "그 출력을 uart_capture.py 로 파일에 받고 있어야 합니다."
+  read -r -p "둘 다 확인했으면 yes 입력: " ans
+  [[ "$ans" == "yes" ]] || fail "UART 주기 출력 또는 로그 수집이 확인되지 않아 중단"
 fi
-snap t0
-python3 "$PARSE" --show "$OUT/t0.bin" > "$OUT/t0.txt" || fail "스냅샷을 해석하지 못함"
-pass "T0 시리얼 $serial, ONCS=$oncs, DISC-MAX=$disc_max, 스냅샷 정상"
+cp_mark t0
+pass "T0 시리얼 $serial, ONCS=$oncs, DISC-MAX=$disc_max"
 
 # ---------- T1 ----------
 say "== T1 쓰기 카운터 =="
 wr /dev/zero 0 256
-snap t1
-expect "host_wr_B (256MiB 쓰기)" "$(delta t0 t1 host_wr_B)" "$((256 * MiB))"
-expect "dsm_cmd (discard를 보내지 않음)" "$(delta t0 t1 dsm_cmd)" "0"
-pass "T1"
+cp_mark t1
+want "T1 256MiB 쓰기" t0 t1 host_wr_B eq "$((256 * MiB))"
+want "T1 discard 없음" t0 t1 dsm_cmd eq 0
+pass "T1 (카운터는 나중에 판정)"
 
 # ---------- T2 ----------
 say "== T2 Deallocate 기본 =="
-flush_buf; snap t2a
-trim 0 $((64 * MiB)); snap t2b
-(( $(delta t2a t2b dsm_cmd) >= 1 )) || fail "discard 명령이 펌웨어에 도달하지 않음"
-expect "dsm_req_B" "$(delta t2a t2b dsm_req_B)" "$((64 * MiB))"
-expect "dsm_inval_B" "$(delta t2a t2b dsm_inval_B)" "$((64 * MiB))"
-expect "dsm_ignored_B" "$(delta t2a t2b dsm_ignored_B)" "0"
-expect "dsm_busy_B" "$(delta t2a t2b dsm_busy_B)" "0"
-expect "dsm_errors" "$(delta t2a t2b dsm_errors)" "0"
-expect "dsm_gc_busy_cmds (GC 중이라 통째로 건너뛴 명령)" "$(delta t2a t2b dsm_gc_busy_cmds)" "0"
-trim 0 $((64 * MiB)); snap t2c
-expect "같은 범위 재요청: dsm_inval_B" "$(delta t2b t2c dsm_inval_B)" "0"
-expect "같은 범위 재요청: dsm_already_free_B" "$(delta t2b t2c dsm_already_free_B)" "$((64 * MiB))"
-# 방금 쓴 1MiB(64 slice)는 아직 data buffer에 dirty로 남아 있으므로 건너뛰어야 한다(dsm_ignored_B에 포함).
+flush_buf; cp_mark t2a
+trim 0 $((64 * MiB)); cp_mark t2b
+want "T2 discard 도달" t2a t2b dsm_cmd ge 1
+want "T2 요청량" t2a t2b dsm_req_B eq "$((64 * MiB))"
+want "T2 무효화" t2a t2b dsm_inval_B eq "$((64 * MiB))"
+want "T2 무시 없음" t2a t2b dsm_ignored_B eq 0
+trim 0 $((64 * MiB)); cp_mark t2c
+want "T2 재요청 무효화 없음" t2b t2c dsm_inval_B eq 0
+want "T2 재요청은 이미 해제" t2b t2c dsm_already_free_B eq "$((64 * MiB))"
+# 방금 쓴 1MiB(64 slice)는 아직 data buffer에 dirty로 남아 있으므로 건너뛰어야 한다(dsm_ignored_B로 잡힘).
 # buffer를 비운 뒤에는 무효화된다.
-wr /dev/zero 320 1; snap t2d
-trim $((320 * MiB)) $((1 * MiB)); snap t2e
-expect "buffer에 남은 범위: dsm_busy_B" "$(delta t2d t2e dsm_busy_B)" "$((1 * MiB))"
-expect "buffer에 남은 범위: dsm_inval_B" "$(delta t2d t2e dsm_inval_B)" "0"
+wr /dev/zero 320 1; cp_mark t2d
+trim $((320 * MiB)) $((1 * MiB)); cp_mark t2e
+want "T2 buffer 범위는 건너뜀" t2d t2e dsm_ignored_B eq "$((1 * MiB))"
+want "T2 buffer 범위 무효화 없음" t2d t2e dsm_inval_B eq 0
 flush_buf
-trim $((320 * MiB)) $((1 * MiB)); snap t2f
-expect "buffer를 비운 뒤: dsm_inval_B" "$(delta t2e t2f dsm_inval_B)" "$((1 * MiB))"
-pass "T2"
+trim $((320 * MiB)) $((1 * MiB)); cp_mark t2f
+want "T2 buffer 비운 뒤 무효화" t2e t2f dsm_inval_B eq "$((1 * MiB))"
+pass "T2 (카운터는 나중에 판정)"
 
 # ---------- T3 ----------
 say "== T3 slice 경계 =="
@@ -130,17 +142,17 @@ wr "$OUT/t3_ref.bin" 128 2
 flush_buf
 edge_before=$( { rd_slice "$base"; rd_slice $((base + MiB)); } | sha256sum | cut -c1-16)
 flush_buf   # 방금 읽은 양쪽 slice가 buffer에 남아 있으면 경계 처리가 틀려도 가려진다
-snap t3a
-trim $((base + LBA)) $((1 * MiB)); snap t3b
-expect "dsm_inval_B (63 slice)" "$(delta t3a t3b dsm_inval_B)" "$((63 * SLICE))"
-expect "dsm_ignored_B (LBA 4개)" "$(delta t3a t3b dsm_ignored_B)" "$((4 * LBA))"
+cp_mark t3a
+trim $((base + LBA)) $((1 * MiB)); cp_mark t3b
+want "T3 63 slice 무효화" t3a t3b dsm_inval_B eq "$((63 * SLICE))"
+want "T3 LBA 4개 무시" t3a t3b dsm_ignored_B eq "$((4 * LBA))"
 edge_after=$( { rd_slice "$base"; rd_slice $((base + MiB)); } | sha256sum | cut -c1-16)
 expect "일부만 덮인 양쪽 slice의 내용" "$edge_after" "$edge_before"
 # slice 하나 안에 들어가는 범위(LBA 2개)는 전부 무시
-trim $((base + 64 * MiB + LBA)) $((2 * LBA)); snap t3c
-expect "slice보다 작은 범위: dsm_inval_B" "$(delta t3b t3c dsm_inval_B)" "0"
-expect "slice보다 작은 범위: dsm_ignored_B" "$(delta t3b t3c dsm_ignored_B)" "$((2 * LBA))"
-pass "T3"
+trim $((base + 64 * MiB + LBA)) $((2 * LBA)); cp_mark t3c
+want "T3 slice보다 작은 범위 무효화 없음" t3b t3c dsm_inval_B eq 0
+want "T3 slice보다 작은 범위 무시" t3b t3c dsm_ignored_B eq "$((2 * LBA))"
+pass "T3 (내용 확인 완료, 카운터는 나중에 판정)"
 
 # ---------- T4 ----------
 say "== T4 데이터 보존 =="
@@ -149,9 +161,9 @@ head -c $((32 * MiB)) /dev/urandom > "$OUT/t4_b.bin"
 head -c $((32 * MiB)) /dev/urandom > "$OUT/t4_a2.bin"
 wr "$OUT/t4_a.bin" 256 32      # A
 wr "$OUT/t4_b.bin" 288 32      # B (A 바로 뒤)
-flush_buf; snap t4a
-trim $((256 * MiB)) $((32 * MiB)); snap t4b
-expect "A discard: dsm_inval_B" "$(delta t4a t4b dsm_inval_B)" "$((32 * MiB))"
+flush_buf; cp_mark t4a
+trim $((256 * MiB)) $((32 * MiB)); cp_mark t4b
+want "T4 A 무효화" t4a t4b dsm_inval_B eq "$((32 * MiB))"
 rd 288 32 | cmp -s - "$OUT/t4_b.bin" || fail "discard 하지 않은 범위 B의 내용이 바뀜"
 say "      ok   B 내용 유지"
 rd 256 32 > /dev/null || fail "discard 한 범위 A를 읽는 중 오류"
@@ -167,7 +179,7 @@ pass "T4"
 # ---------- T5 ----------
 say "== T5 쓰기와 discard 동시 실행 =="
 # C(512~768MiB): fio가 쓰고 CRC로 검증. D(1024~1280MiB): 그동안 16MiB씩 쓰고 바로 discard.
-snap t5a
+cp_mark t5a
 fio --name=t5 --filename="$DEV" --offset=$((512 * MiB)) --size=$((256 * MiB)) \
     --rw=write --bs=1M --ioengine=libaio --iodepth=16 $FD \
     --verify=crc32c --do_verify=1 --loops="$T5_LOOPS" \
@@ -181,16 +193,20 @@ while kill -0 "$fio_pid" 2>/dev/null; do
   churn=$((churn + 1))
 done
 wait "$fio_pid" || fail "fio 검증 실패: $OUT/t5_fio.txt"
-snap t5b
+cp_mark t5b
 (( churn >= 1 )) || fail "discard가 fio와 겹쳐 실행되지 않음"
-(( $(delta t5a t5b dsm_cmd) >= churn )) || fail "보낸 discard 수보다 펌웨어가 센 수가 적음"
-expect "dsm_errors" "$(delta t5a t5b dsm_errors)" "0"
-say "      참고 dsm_gc_busy_cmds = $(delta t5a t5b dsm_gc_busy_cmds), dsm_busy_B = $(delta t5a t5b dsm_busy_B)"
-expect "dsm_nest_err" "$(delta t5a t5b dsm_nest_err)" "0"
-expect "erase_fail" "$(delta t5a t5b erase_fail)" "0"
-pass "T5 (쓰기·discard 반복 ${churn}회)"
+want "T5 discard 수" t5a t5b dsm_cmd ge "$churn"
+want "T5 DSM 중첩 오류 없음" t5a t5b dsm_nest_err eq 0
+want "T5 erase 실패 없음" t5a t5b erase_fail eq 0
+pass "T5 (쓰기·discard 반복 ${churn}회, CRC 검증 통과)"
 
 say ""
-say "전체 통과. 누적 카운터와 DSM 분포:"
-python3 "$PARSE" --bin "$OUT/t0.bin" "$OUT/t5b.bin" | tee -a "$REPORT"
-say "결과 폴더: $OUT"
+say "데이터 검사 전체 통과. 결과 폴더: $OUT"
+if [[ -n "$UART_LOG" && -r "$UART_LOG" ]]; then
+  say "카운터 판정 (UART 로그: $UART_LOG):"
+  python3 "$PARSE" --check "$OUT" "$UART_LOG" --skew "${SKEW:-1.0}" | tee -a "$REPORT" || exit 1
+else
+  say "카운터 판정은 UART 로그를 받은 뒤에 합니다:"
+  say "  1) UART를 받은 PC에서 uart.log 를 이 PC로 복사"
+  say "  2) python3 $PARSE --check $OUT <uart.log>"
+fi
