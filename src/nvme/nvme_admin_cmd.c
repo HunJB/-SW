@@ -334,10 +334,20 @@ void handle_identify(NVME_ADMIN_COMMAND *nvmeAdminCmd, NVME_COMPLETION *nvmeCPL)
 	unsigned int pIdentifyData = ADMIN_CMD_DRAM_DATA_BUFFER;
 	unsigned int prp[2];
 	unsigned int prpLen;
+	unsigned int *activeNamespaceList;
 
 	identifyInfo.dword = nvmeAdminCmd->dword10;
 
-	if(identifyInfo.CNS == 1)
+	/*
+	 * NVMe Identify CNS values used by this firmware:
+	 *
+	 *   0x00 : Identify Namespace
+	 *   0x01 : Identify Controller
+	 *   0x02 : Active Namespace ID List
+	 *
+	 * Cosmos+ exposes exactly one namespace and its NSID is 1.
+	 */
+	if(identifyInfo.CNS == 0x01)
 	{
 		if((nvmeAdminCmd->PRP1[0] & 0x3) != 0 || (nvmeAdminCmd->PRP2[0] & 0x3) != 0)
 			xil_printf("CI: %X, %X, %X, %X\r\n", nvmeAdminCmd->PRP1[1], nvmeAdminCmd->PRP1[0], nvmeAdminCmd->PRP2[1], nvmeAdminCmd->PRP2[0]);
@@ -345,17 +355,66 @@ void handle_identify(NVME_ADMIN_COMMAND *nvmeAdminCmd, NVME_COMPLETION *nvmeCPL)
 		ASSERT((nvmeAdminCmd->PRP1[0] & 0x3) == 0 && (nvmeAdminCmd->PRP2[0] & 0x3) == 0);
 		identify_controller(pIdentifyData);
 	}
-	else if(identifyInfo.CNS == 0)
+	else if(identifyInfo.CNS == 0x00)
 	{
+		/*
+		 * A Namespace Identify command must refer to the one namespace that
+		 * this firmware exposes.  Return INVALID_NS instead of asserting so a
+		 * malformed host command cannot stop the firmware.
+		 */
+		if(nvmeAdminCmd->NSID != 1)
+		{
+			nvmeCPL->dword[0] = 0;
+			nvmeCPL->statusField.SC = SC_INVALID_NAMESPACE_OR_FORMAT;
+			nvmeCPL->statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
+			nvmeCPL->statusField.DNR = 1;
+			nvmeCPL->specific = 0x0;
+			return;
+		}
+
 		if((nvmeAdminCmd->PRP1[0] & 0x3) != 0 || (nvmeAdminCmd->PRP2[0] & 0x3) != 0)
 			xil_printf("NI: %X, %X, %X, %X\r\n", nvmeAdminCmd->PRP1[1], nvmeAdminCmd->PRP1[0], nvmeAdminCmd->PRP2[1], nvmeAdminCmd->PRP2[0]);
-		//ASSERT(nvmeAdminCmd->NSID == 1);
+
 		ASSERT((nvmeAdminCmd->PRP1[0] & 0x3) == 0 && (nvmeAdminCmd->PRP2[0] & 0x3) == 0);
 		identify_namespace(pIdentifyData);
 	}
+	else if(identifyInfo.CNS == 0x02)
+	{
+		/*
+		 * Active Namespace ID List.
+		 *
+		 * The returned 4-KiB data structure is an array of 1024 little-endian
+		 * 32-bit NSIDs.  Entries contain active NSIDs greater than the NSID
+		 * supplied in the command, followed by zeroes.
+		 *
+		 * This controller has one active namespace: NSID 1.
+		 */
+		ASSERT((nvmeAdminCmd->PRP1[0] & 0x3) == 0 && (nvmeAdminCmd->PRP2[0] & 0x3) == 0);
+
+		memset((void *)pIdentifyData, 0, 0x1000);
+		activeNamespaceList = (unsigned int *)pIdentifyData;
+
+		if(nvmeAdminCmd->NSID < 1)
+			activeNamespaceList[0] = 1;
+
+		xil_printf("Active Namespace List: start NSID=%u, first=%u\r\n",
+				nvmeAdminCmd->NSID, activeNamespaceList[0]);
+	}
 	else
-		ASSERT(0);
-	
+	{
+		/*
+		 * Do not ASSERT on newer/unsupported Identify CNS values.  Returning
+		 * INVALID_FIELD is safer and lets the host fall back when appropriate.
+		 */
+		xil_printf("Unsupported Identify CNS: 0x%X\r\n", identifyInfo.CNS);
+		nvmeCPL->dword[0] = 0;
+		nvmeCPL->statusField.SC = SC_INVALID_FIELD_IN_COMMAND;
+		nvmeCPL->statusField.SCT = SCT_GENERIC_COMMAND_STATUS;
+		nvmeCPL->statusField.DNR = 1;
+		nvmeCPL->specific = 0x0;
+		return;
+	}
+
 	prp[0] = nvmeAdminCmd->PRP1[0];
 	prp[1] = nvmeAdminCmd->PRP1[1];
 

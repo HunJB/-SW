@@ -67,6 +67,7 @@
 #include "nvme_io_cmd.h"
 
 #include "../memory_map.h"
+#include "../exp_stat.h"
 
 volatile NVME_CONTEXT g_nvmeTask;
 
@@ -78,6 +79,7 @@ void nvme_main()
 	xil_printf("!!! Wait until FTL reset complete !!! \r\n");
 
 	InitFTL();
+	exp_stat_init();
 
 	xil_printf("\r\nFTL reset complete!!! \r\n");
 	xil_printf("Turn on the host PC \r\n");
@@ -85,6 +87,7 @@ void nvme_main()
 	while(1)
 	{
 		exeLlr = 1;
+		exp_stat_poll(); /* default period=0: no output during I/O */
 
 
 		if(g_nvmeTask.status == NVME_TASK_WAIT_CC_EN)
@@ -137,6 +140,8 @@ void nvme_main()
 				g_nvmeTask.cacheEn = 0;
 				set_nvme_csts_shst(2);
 				g_nvmeTask.status = NVME_TASK_WAIT_RESET;
+
+				exp_stat_dump("SHUTDOWN");
 
 				//flush grown bad block info
 				UpdateBadBlockTableForGrownBadBlock(RESERVED_DATA_BUFFER_BASE_ADDR);

@@ -1,3 +1,4 @@
+#include "exp_stat.h"
 //////////////////////////////////////////////////////////////////////////////////
 // request_schedule.c for Cosmos+ OpenSSD
 // Copyright (c) 2017 Hanyang University ENC Lab.
@@ -675,12 +676,21 @@ void IssueNandReq(unsigned int chNo, unsigned int wayNo)
 		dieStateTablePtr->dieState[chNo][wayNo].reqStatusCheckOpt = REQ_STATUS_CHECK_OPT_CHECK;
 
 		V2FProgramPageAsync(&chCtlReg[chNo], wayNo, rowAddr, dataBufAddr, spareDataBufAddr);
+
+        /* Classification verified against this source snapshot's three writers. */
+        if (reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat == REQ_OPT_DATA_BUF_TEMP_ENTRY)
+            exp_on_nand_program(EXP_PROG_GC, BYTES_PER_DATA_REGION_OF_PAGE);
+        else if (reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat == REQ_OPT_DATA_BUF_ENTRY)
+            exp_on_nand_program(EXP_PROG_HOST, BYTES_PER_DATA_REGION_OF_PAGE);
+        else
+            exp_on_nand_program(EXP_PROG_META, BYTES_PER_DATA_REGION_OF_PAGE);
 	}
 	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_ERASE)
 	{
 		dieStateTablePtr->dieState[chNo][wayNo].reqStatusCheckOpt = REQ_STATUS_CHECK_OPT_CHECK;
 
 		V2FEraseBlockAsync(&chCtlReg[chNo], wayNo, rowAddr);
+		exp_on_erase_issued();
 	}
 	else if(reqPoolPtr->reqPool[reqSlotTag].reqCode == REQ_CODE_RESET)
 	{

@@ -57,8 +57,10 @@
 #include "nvme.h"
 #include "host_lld.h"
 #include "nvme_io_cmd.h"
+#include "dsm_deallocate.h"
 
 #include "../ftl_config.h"
+#include "../exp_stat.h"
 #include "../request_transform.h"
 
 void handle_nvme_io_read(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
@@ -110,6 +112,7 @@ void handle_nvme_io_write(unsigned int cmdSlotTag, NVME_IO_COMMAND *nvmeIOCmd)
 	ASSERT((nvmeIOCmd->PRP1[0] & 0xF) == 0 && (nvmeIOCmd->PRP2[0] & 0xF) == 0);
 	ASSERT(nvmeIOCmd->PRP1[1] < 0x10000 && nvmeIOCmd->PRP2[1] < 0x10000);
 
+	exp_on_host_write(((exp_u64)nlb + 1ULL) * BYTES_PER_NVME_BLOCK);
 	ReqTransNvmeToSlice(cmdSlotTag, startLba[0], nlb, IO_NVM_WRITE);
 }
 
@@ -150,6 +153,11 @@ void handle_nvme_io_cmd(NVME_COMMAND *nvmeCmd)
 		{
 //			xil_printf("IO Read Command\r\n");
 			handle_nvme_io_read(nvmeCmd->cmdSlotTag, nvmeIOCmd);
+			break;
+		}
+		case IO_NVM_DATASET_MANAGEMENT:
+		{
+			HandleDatasetManagement(nvmeCmd);
 			break;
 		}
 		default:

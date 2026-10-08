@@ -418,8 +418,15 @@ typedef struct _ADMIN_IDENTIFY_COMMAND_DW10
 	union {
 		unsigned int dword;
 		struct {
-			unsigned int CNS			:1;
-			unsigned int reserved0		:31;
+			/*
+			 * Identify CNS is CDW10[7:0].
+			 *
+			 * The original Cosmos+ source declared this as one bit.  That aliases
+			 * CNS=0x02 (Active Namespace ID List) to CNS=0x00 (Identify
+			 * Namespace), causing Linux to interpret NSZE as a namespace ID.
+			 */
+			unsigned int CNS			:8;
+			unsigned int reserved0		:24;
 		};
 	};
 } ADMIN_IDENTIFY_COMMAND_DW10;
