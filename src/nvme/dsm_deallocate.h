@@ -16,9 +16,6 @@
 #define DSM_MAX_RANGES              256U
 #define DSM_PAYLOAD_BYTES           (DSM_MAX_RANGES * sizeof(DATASET_MANAGEMENT_RANGE))
 
-/* All fields are unsigned long long: DsmSnapshot() copies the struct as an
- * array. Append new fields at the end and add the name to
- * tools/parse_expstat.py (DSM_FIELDS) in the same place. */
 typedef struct _DSM_STATS
 {
     unsigned long long cmdCount;
@@ -47,9 +44,5 @@ extern DSM_STATS dsmStats;
 void HandleDatasetManagement(NVME_COMMAND *nvmeCmd);
 void DsmPrintStats(void);
 void DsmResetStats(void);
-
-/* Append the DSM statistics to a host snapshot (vendor admin 0xC2).
- * Layout: u64 number of fields, then DSM_STATS as u64[]. Returns bytes written. */
-unsigned int DsmSnapshot(void *buf, unsigned int maxBytes);
 
 #endif /* DSM_DEALLOCATE_H_ */

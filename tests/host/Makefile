@@ -17,8 +17,11 @@ CHANGED := exp_stat.c nvme/dsm_deallocate.c nvme/nvme_io_cmd.c nvme/nvme_admin_c
 .PHONY: test syntax clean
 
 test: build/test_dsm
-	./build/test_dsm build/before.bin build/after.bin
-	python3 $(TOOLS)/parse_expstat.py --selftest build/before.bin build/after.bin
+	./build/test_dsm build/uart.log
+	python3 $(TOOLS)/parse_expstat.py --selftest build/uart.log
+	python3 $(TOOLS)/parse_expstat.py build/uart.log --from 2 --to 3 --json > build/diff.json
+	python3 -c 'import json; d = json.load(open("build/diff.json")); assert d["host_wr_B"] == 1234 and d["gc_copy_B"] == 56, d'
+
 	@echo "PC 시험 통과"
 
 build/test_dsm: test_dsm.c $(FW) $(SRC)/exp_stat.h $(SRC)/nvme/dsm_deallocate.h

@@ -1,20 +1,16 @@
 /*
  * exp_stat.h
- * Measurement counters for the Cosmos+ OpenSSD firmware
- * (discard policy vs. garbage collection experiment)
+ * Cosmos+ OpenSSD �럩�썾�뼱�슜 �떎�뿕 怨꾩륫 紐⑤뱢 (discard 諛⑹떇怨� GC 鍮꾧탳 �떎�뿕)
  *
- * Adding this file alone measures nothing. Each exp_on_*() call has to be
- * placed at the matching point of the firmware (see docs/INTEGRATION.md).
+ * �씠 �뙆�씪�쓣 異붽��븯�뒗 寃껊쭔�쑝濡쒕뒗 �븘臾닿쾬�룄 痢≪젙�릺吏� �븡�뒗�떎.
+ * 湲곗〈 �럩�썾�뼱�쓽 �빐�떦 �룞�옉 吏��젏�뿉 exp_on_*() �샇異쒖쓣 �븳 以꾩뵫 �꽔�뼱�빞 �븳�떎.
+ * �꽔�쓣 �쐞移섏� 二쇱쓽�궗�빆�� INTEGRATION.md 李멸퀬.
  *
- *  - Every counter is a 64-bit running total. Use the difference between the
- *    start and the end of a measurement instead of resetting.
- *  - Nothing is printed per page. UART output happens at boot, on shutdown,
- *    on the marker command, and periodically only if the period is not 0.
- *  - Units are bytes (or counts, timer ticks). Callers convert pages/slices.
- *  - The host reads the counters with the vendor admin command 0xC2
- *    (4KB binary snapshot). tools/parse_expstat.py decodes it.
- *
- * Only the NVMe main loop updates these counters (no ISR, no second core).
+ * �꽕怨� �썝移�
+ *  - 紐⑤뱺 移댁슫�꽣�뒗 64鍮꾪듃 �늻�쟻媛믪씠�떎. 痢≪젙 �떆�옉怨� �걹�쓽 李⑥씠濡� 怨꾩궛�븳�떎.
+ *  - 留� �럹�씠吏�留덈떎 UART濡� 異쒕젰�븯吏� �븡�뒗�떎. 異쒕젰�� 二쇨린�쟻 �삉�뒗 留덉빱 紐낅졊 �븣留� �븳�떎.
+ *  - �떒�쐞�뒗 紐⑤몢 諛붿씠�듃(�삉�뒗 �슏�닔, tick)�떎. �샇異쒗븯�뒗 履쎌뿉�꽌 �럹�씠吏�쨌�뒳�씪�씠�뒪 �닔瑜�
+ *    諛붿씠�듃濡� 諛붽퓭�꽌 �꽆湲대떎. �씠�젃寃� �빐�빞 留ㅽ븨 �떒�쐞媛� �떖�씪�룄 �빐�꽍�씠 媛숇떎.
  */
 #ifndef EXP_STAT_H_
 #define EXP_STAT_H_
@@ -26,142 +22,108 @@ extern "C" {
 typedef unsigned long long exp_u64;
 typedef unsigned int       exp_u32;
 
-/* ---------- configuration ---------- */
+/* ---------- �꽕�젙 ---------- */
 
-/* Period of the UART dump in seconds. 0 = off.
- * One line takes about 40 ms at 115200 bps and blocks the firmware meanwhile,
- * which shows up in the host read p99. Keep it 0 for latency measurements and
- * use the snapshot command. Set it to 10 only for UART-based checks. */
+/* 二쇨린�쟻 UART 異쒕젰 媛꾧꺽(珥�). 0�씠硫� 二쇨린 異쒕젰�쓣 �걟�떎(留덉빱 紐낅졊�쑝濡쒕쭔 異쒕젰). */
 #ifndef EXP_STAT_PRINT_PERIOD_SEC
-#define EXP_STAT_PRINT_PERIOD_SEC 0
+#define EXP_STAT_PRINT_PERIOD_SEC 10
 #endif
 
-/* vendor specific admin opcodes */
-#define EXP_ADMIN_OPC_MARKER    0xC0   /* print one UART line. cdw10 = 1: reset afterwards */
-#define EXP_ADMIN_OPC_SNAPSHOT  0xC2   /* return counters to the host in a 4KB buffer */
-
-#define EXP_SNAPSHOT_MAGIC      0x3354415453505845ULL   /* "EXPSTAT3" (little endian) */
-#define EXP_SNAPSHOT_BYTES      4096
-#define EXP_SNAPSHOT_HEADER_NR  4      /* magic, tick, counts per second, number of fields */
-
-/* per-command DSM histograms (log2 buckets) */
-#define EXP_HIST_TICKS_NR       40     /* bucket i: 2^i <= handling time in ticks < 2^(i+1) */
-#define EXP_HIST_LBA_NR         32     /* bucket i: 2^i <= requested 4KB blocks < 2^(i+1) */
-
-/* cause of a NAND program */
+/* NAND program �썝�씤 援щ텇 */
 typedef enum {
-    EXP_PROG_HOST = 0,   /* program of host data (data buffer eviction) */
-    EXP_PROG_GC   = 1,   /* program of valid data copied by GC */
-    EXP_PROG_META = 2,   /* any other program (bad block table, ...) */
+    EXP_PROG_HOST = 0,   /* host write濡� �씤�븳 program */
+    EXP_PROG_GC   = 1,   /* GC �쑀�슚 �뜲�씠�꽣 �씠�룞�쑝濡� �씤�븳 program */
+    EXP_PROG_META = 2,   /* 留ㅽ븨 �뀒�씠釉� �벑 硫뷀��뜲�씠�꽣 program */
     EXP_PROG_NR
 } exp_prog_cause_t;
 
-/* ---------- counters ----------
- * All fields are exp_u64: the snapshot copies the struct as an array.
- * Append new fields at the end only, and add the same name at the same place
- * in tools/parse_expstat.py (tests/host checks the order). */
+/* ---------- 移댁슫�꽣 臾띠쓬 ---------- */
 typedef struct {
-    /* host write bytes (NVMe write command accepted) */
+    /* 痢≪젙 �빆紐�: Host �벐湲� 諛붿씠�듃 (NVMe �벐湲� 紐낅졊 泥섎━) */
     exp_u64 host_write_bytes;
     exp_u64 host_write_cmds;
 
-    /* bytes of valid data GC decided to copy (request issue time) */
+    /* 痢≪젙 �빆紐�: GC 蹂듭궗 諛붿씠�듃 (GC媛� �쑀�슚 �뜲�씠�꽣瑜� �씠�룞�븯�뒗 泥섎━) */
     exp_u64 gc_copy_bytes;
 
-    /* GC victims whose copy/erase requests were all issued (not completed) */
+    /* 痢≪젙 �빆紐�: GC �슏�닔 (victim�쓽 蹂듭궗/erase �슂泥� �깮�꽦�쓣 留덉튇 �떆�젏; �셿猷� �븘�떂) */
     exp_u64 gc_count;
-    exp_u64 gc_victim_valid_bytes;   /* valid bytes found in those victims */
+    exp_u64 gc_victim_valid_bytes;   /* �슂泥��쓣 �깮�꽦�븳 victim�뱾�쓽 �쑀�슚 �뜲�씠�꽣 �빀 */
 
-    /* block erases */
-    exp_u64 erase_issued;            /* erase requests handed to the NAND driver */
-    exp_u64 erase_count;             /* completed erases (not tracked in this build) */
+    /* 痢≪젙 �빆紐�: Erase �슏�닔 (NAND 釉붾줉 �궘�젣 泥섎━) */
+    exp_u64 erase_issued; /* �뱶�씪�씠踰� erase �샇異� �슏�닔 */
+    exp_u64 erase_count;
     exp_u64 erase_fail;
 
-    /* Dataset Management commands received */
+    /* 痢≪젙 �빆紐�: DSM 紐낅졊 �닔 (Dataset Management 紐낅졊 �닔�떊) */
     exp_u64 dsm_cmd_count;
     exp_u64 dsm_range_count;
-    exp_u64 dsm_req_bytes;           /* total bytes requested by the host */
+    exp_u64 dsm_req_bytes;           /* �샇�뒪�듃媛� �슂泥��븳 踰붿쐞�쓽 �빀 */
 
-    /* result of Deallocate */
-    exp_u64 dsm_invalid_bytes;       /* was valid, now invalidated */
-    exp_u64 dsm_ignored_bytes;       /* not applied: partial slice, busy buffer entry, GC in flight */
-    exp_u64 dsm_already_free_bytes;  /* already unmapped or never written */
+    /* 痢≪젙 �빆紐�: DSM�쑝濡� �깉濡� 臾댄슚�솕�븳 諛붿씠�듃 (Deallocate�뿉 �뵲瑜� 留ㅽ븨 臾댄슚�솕) */
+    exp_u64 dsm_invalid_bytes;       /* �씠�쟾�뿉 �쑀�슚�뻽�뜕 �뜲�씠�꽣 以� �씠踰덉뿉 臾댄슚�솕�븳 �뼇 */
+    exp_u64 dsm_ignored_bytes;       /* 遺�遺� 留ㅽ븨 �떒�쐞 �벑�쑝濡� 臾댁떆�븳 �뼇 */
+    exp_u64 dsm_already_free_bytes;  /* �씠誘� 臾댄슚�씠嫄곕굹 湲곕줉�맂 �쟻 �뾾�뒗 踰붿쐞 */
 
-    /* time spent handling DSM commands, in timer ticks */
+    /* 痢≪젙 �빆紐�: DSM 泥섎━ �떆媛� (�젙�빐吏� DSM 泥섎━ 援ш컙�쓽 �떆�옉쨌醫낅즺) */
     exp_u64 dsm_ticks_total;
     exp_u64 dsm_ticks_max;
 
-    /* NAND program bytes by cause, for WAF */
+    /* WAF 怨꾩궛�슜: NAND program 諛붿씠�듃瑜� �썝�씤蹂꾨줈 */
     exp_u64 nand_prog_bytes[EXP_PROG_NR];
 
-    /* self check */
-    exp_u64 dsm_nesting_error;       /* end without begin, or nested begin */
-    exp_u64 epoch;                   /* incremented on every reset */
-    exp_u64 dump_seq;                /* UART dump sequence number */
-
-    /* --- added for snapshot schema 3. Append below, never reorder. --- */
-    exp_u64 dsm_hist_ticks[EXP_HIST_TICKS_NR];   /* per-command handling time */
-    exp_u64 dsm_hist_lba[EXP_HIST_LBA_NR];       /* per-command requested size */
+    /* 怨꾩륫 �옄泥� �젏寃� */
+    exp_u64 dsm_nesting_error;       /* begin �뾾�씠 end, �삉�뒗 begin 以묐났 */
+    exp_u64 epoch; /* reset 寃쎄퀎 �떇蹂� */
+    exp_u64 dump_seq;                /* 異쒕젰 �씪�젴踰덊샇 */
 } exp_stat_t;
 
+/* 紐⑤뱺 媛깆떊/異쒕젰�� �떒�씪 NVMe 硫붿씤 �떎�뻾 �쓲由꾩뿉�꽌留� �샇異�. ISR/�떎瑜� 肄붿뼱 湲덉�. */
 extern exp_stat_t g_exp_stat;
 
-/* ---------- init and output ---------- */
+/* ---------- 珥덇린�솕쨌異쒕젰 ---------- */
 
-/* call once after InitFTL() */
+/* �럩�썾�뼱 珥덇린�솕 �걹 臾대졄 �븳 踰� �샇異� */
 void exp_stat_init(void);
 
-/* zero every counter (epoch and dump_seq are kept). Prefer differences. */
+/* 紐⑤뱺 移댁슫�꽣瑜� 0�쑝濡�. 痢≪젙留덈떎 由ъ뀑�븯吏� �븡怨� 李⑤텇�쑝濡� 怨꾩궛�븯�뒗 寃껋쓣 沅뚯옣 */
 void exp_stat_reset(void);
 
-/* print the current values to UART in one line. tag: "PERIOD", "MARK", "BOOT", ... */
+/* �쁽�옱 媛믪쓣 UART�뿉 �븳 以꾨줈 異쒕젰. tag�뒗 "PERIOD", "MARK", "BOOT" �벑 */
 void exp_stat_dump(const char *tag);
 
-/* call from the main loop. Dumps when the period elapsed (no-op if period is 0) */
+/* 硫붿씤 猷⑦봽�뿉�꽌 留ㅻ쾲 �샇異�. 二쇨린媛� �릺硫� exp_stat_dump("PERIOD") */
 void exp_stat_poll(void);
 
-/* marker command from the host: arg = 0 print only, arg = 1 print then reset */
+/* �샇�뒪�듃媛� 蹂대궦 留덉빱 紐낅졊 泥섎━ (�꽑�깮, INTEGRATION.md 4�젅)
+ *   arg = 0 : 異쒕젰留�
+ *   arg = 1 : 異쒕젰 �썑 由ъ뀑                                    */
 void exp_stat_on_marker(exp_u32 arg);
 
-/* write the counters to buf in binary and return the bytes used.
- *   u64 magic, u64 tick, u64 counts_per_second, u64 nfields, exp_stat_t
- * The caller may append more sections after the returned length. */
-exp_u32 exp_stat_snapshot(void *buf);
+/* ---------- �룞�옉 吏��젏�뿉 �꽔�쓣 �샇異� ---------- */
 
-/* ---------- calls placed in the firmware ---------- */
-
-/* floor(log2(v)), 0 for v <= 1, capped at nr - 1 */
-static inline unsigned int exp_log2_bucket(exp_u64 v, unsigned int nr)
-{
-    unsigned int b = 0;
-    while (v > 1) {
-        v >>= 1;
-        b++;
-    }
-    return (b < nr) ? b : (nr - 1);
-}
-
-/* once per accepted NVMe write command. bytes = (NLB + 1) * LBA size */
+/* NVMe �벐湲� 紐낅졊 �븯�굹瑜� 諛쏆븘�뱾�씪 �븣 �븳 踰�. bytes = (NLB + 1) * LBA �겕湲� */
 static inline void exp_on_host_write(exp_u64 bytes)
 {
     g_exp_stat.host_write_cmds++;
     g_exp_stat.host_write_bytes += bytes;
 }
 
-/* once per valid slice GC decides to move (write side only) */
+/* GC媛� �쑀�슚 �뜲�씠�꽣 �븳 �떒�쐞瑜� �깉 �쐞移섎줈 �삷湲곕룄濡� �솗�젙�븷 �븣 �븳 踰�.
+ * 媛숈� �뜲�씠�꽣�뿉 ���빐 �씫湲� �슂泥�怨� �벐湲� �슂泥� �뼇履쎌뿉�꽌 遺�瑜댁� 留� 寃� */
 static inline void exp_on_gc_copy(exp_u64 bytes)
 {
     g_exp_stat.gc_copy_bytes += bytes;
 }
 
-/* once per victim, after all its copy/erase requests were issued */
+/* victim �븯�굹�쓽 蹂듭궗/erase �슂泥��쓣 紐⑤몢 �깮�꽦�뻽�쓣 �븣 �븳 踰�. NAND �셿猷� �븘�떂. */
 static inline void exp_on_gc_victim_scheduled(exp_u64 victim_valid_bytes)
 {
     g_exp_stat.gc_count++;
     g_exp_stat.gc_victim_valid_bytes += victim_valid_bytes;
 }
 
-/* only where the completion status is really known (not wired in this build) */
+/* �떎�젣 �셿猷� �긽�깭瑜� �솗�씤�븳 寃쎌슦�뿉留� �샇異�. �씠踰� �넻�빀�뿉�꽌�뒗 �뿰寃고븯吏� �븡�쓬. */
 static inline void exp_on_erase(int ok)
 {
     if (ok) g_exp_stat.erase_count++;
@@ -173,41 +135,41 @@ static inline void exp_on_erase_issued(void)
     g_exp_stat.erase_issued++;
 }
 
-/* one NAND program request handed to the driver */
+/* NAND program 諛쒗뻾 �븯�굹. �썝�씤怨� �뜲�씠�꽣 �쁺�뿭 諛붿씠�듃 */
 static inline void exp_on_nand_program(exp_prog_cause_t cause, exp_u64 bytes)
 {
     if ((unsigned)cause < EXP_PROG_NR)
         g_exp_stat.nand_prog_bytes[cause] += bytes;
 }
 
-/* once per DSM command (counted even without the Deallocate attribute) */
+/* DSM 紐낅졊 �븯�굹瑜� 諛쏆븯�쓣 �븣 �븳 踰� (Deallocate �냽�꽦�씠 �뾾�뼱�룄 �꽱�떎) */
 static inline void exp_on_dsm_cmd(exp_u32 nranges, exp_u64 req_bytes)
 {
     g_exp_stat.dsm_cmd_count++;
     g_exp_stat.dsm_range_count += nranges;
     g_exp_stat.dsm_req_bytes += req_bytes;
-    g_exp_stat.dsm_hist_lba[exp_log2_bucket(req_bytes / 4096ULL, EXP_HIST_LBA_NR)]++;
 }
 
-/* a slice that was valid has been invalidated */
+/* 留ㅽ븨 �떒�쐞 �븯�굹瑜� �떎�젣濡� 臾댄슚�솕�뻽�쓣 �븣(吏곸쟾源뚯� �쑀�슚���뜕 寃쎌슦留�) */
 static inline void exp_on_dsm_invalidated(exp_u64 bytes)
 {
     g_exp_stat.dsm_invalid_bytes += bytes;
 }
 
-/* requested bytes that were not applied */
+/* 遺�遺� 留ㅽ븨 �떒�쐞�씪�꽌 臾댁떆�븳 寃쎌슦 */
 static inline void exp_on_dsm_ignored(exp_u64 bytes)
 {
     g_exp_stat.dsm_ignored_bytes += bytes;
 }
 
-/* slice already unmapped */
+/* �씠誘� 臾댄슚��嫄곕굹 湲곕줉�맂 �쟻 �뾾�뒗 留ㅽ븨 �떒�쐞 */
 static inline void exp_on_dsm_already_free(exp_u64 bytes)
 {
     g_exp_stat.dsm_already_free_bytes += bytes;
 }
 
-/* DSM handling time. Call begin at the start and end on every return path */
+/* DSM 泥섎━ �떆媛� 痢≪젙. �븳 DSM 紐낅졊�쓽 泥섎━ �떆�옉怨� �걹�뿉�꽌 �븳 踰덉뵫.
+ * �몢 �샇異� �궗�씠�뿉 return 寃쎈줈媛� �뿬�윭 媛쒕㈃ 紐⑤뱺 寃쎈줈�뿉�꽌 end瑜� 遺�瑜� 寃� */
 void exp_dsm_begin(void);
 void exp_dsm_end(void);
 
