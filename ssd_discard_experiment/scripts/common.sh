@@ -116,21 +116,23 @@ sync_deletes() {
     log_event sync_complete
 }
 
-# ---------- 펌웨어 카운터 스냅샷 (Cosmos+ 계측 펌웨어) ----------
-# EXPSTAT=1 일 때만 동작. 원본 펌웨어는 모르는 admin 명령을 받으면 멈추므로 자동으로 보내지 않는다.
-snapshot() {   # 이름
+# ---------- 펌웨어 카운터 시점 (Cosmos+ 계측 펌웨어) ----------
+# 펌웨어는 10초마다 UART로 누적 카운터(EXPSTAT,tag=PERIOD)를 내보낸다. 호스트는 그 값을 직접 읽지
+# 못하므로, 카운터를 끊어 볼 시점마다 sync 후 CP_WAIT 초 동안 아무것도 하지 않는다. 그 사이에 찍힌
+# PERIOD 줄이 그 시점의 값이 된다. 시점은 host_events.csv 에 checkpoint 로 남는다.
+# EXPSTAT=1 일 때만 기다린다.
+checkpoint() {   # 이름
     [ "${EXPSTAT:-0}" = "1" ] || return 0
-    : "${RUN_DIR:?RUN_DIR 를 설정하세요}"
-    nvme admin-passthru "$DEV" --opcode=0xC2 --data-len=4096 --read --raw-binary \
-        > "$RUN_DIR/expstat_$1.bin" 2> "$RUN_DIR/expstat_$1.err" \
-        || die "카운터 스냅샷 실패: $RUN_DIR/expstat_$1.err"
+    sync
+    log_event checkpoint "$1" "" "$(( ${CP_WAIT:-13} * 1000000000 ))"
+    sleep "${CP_WAIT:-13}"
 }
 
 # ---------- 측정 구간과 cycle 끝 처리 ----------
 # 워크로드는 사전 쓰기가 끝난 뒤 measure_begin 을 한 번, cycle마다 삭제 직후 maybe_trim, 끝에 end_cycle 을 부른다.
 measure_begin() {
     sync
-    snapshot start
+    checkpoint start
     log_event measure_start
 }
 
@@ -152,10 +154,13 @@ maybe_trim() {
     log_event fstrim_end "cycle$c"
 }
 
-# end_cycle <cycle 번호> : 쉬고, 스냅샷을 남긴다.
+# end_cycle <cycle 번호> : 쉰다. EXPSTAT=1 이면 쉬는 시간의 앞부분을 카운터 시점으로 쓴다.
 end_cycle() {
-    local c="$1"
-    sleep "${REST_SEC:-10}"
-    snapshot "c$c"
+    local c="$1" rest="${REST_SEC:-10}"
     log_event cycle_end "cycle$c"
+    if [ "${EXPSTAT:-0}" = "1" ]; then
+        checkpoint "c$c"
+        rest=$(( rest > ${CP_WAIT:-13} ? rest - ${CP_WAIT:-13} : 0 ))
+    fi
+    sleep "$rest"
 }

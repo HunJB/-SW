@@ -2,7 +2,7 @@
 # run_all.sh — 여러 조합을 차례로 run_experiment.sh 에 넘긴다.
 #
 # 사용법 (root):
-#   EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1 ./run_all.sh <mode>
+#   EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1 [UART_LOG=<파일>] ./run_all.sh <mode>
 #
 #   poc    W1 × 4정책 × 1회                      (4회)
 #   main   W1 × 4정책 × REPS회 (기본 5)           (20회)
