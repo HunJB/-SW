@@ -73,6 +73,8 @@ def main():
         p99_m, p99_sd, _ = mean_sd([lat(r, "measure") or lat(r, "whole_run") for r in rows])
         p99t_m, _, _ = mean_sd([lat(r, "during_trim") for r in rows])
         dsm_m, _, _ = mean_sd([r.get("dsm_ms_total") for r in rows])
+        ign_m, _, _ = mean_sd([r.get("dsm_ignored_bytes") for r in rows])
+        gcb_m, _, _ = mean_sd([r.get("dsm_gc_busy_cmds") for r in rows])
         base = baseline.get(w)
         red = (1 - gc_m / base) * 100 if (gc_m is not None and base) else None
         table.append({"workload": w, "policy": label(p, k), "n_runs": len(rows),
@@ -80,7 +82,8 @@ def main():
                       "gc_copy_reduction_vs_nodiscard_pct": red,
                       "waf_mean": waf_m, "waf_sd": waf_sd,
                       "read_p99_ns_mean": p99_m, "read_p99_ns_sd": p99_sd,
-                      "read_p99_ns_during_trim_mean": p99t_m, "dsm_ms_total_mean": dsm_m})
+                      "read_p99_ns_during_trim_mean": p99t_m, "dsm_ms_total_mean": dsm_m,
+                      "dsm_ignored_bytes_mean": ign_m, "dsm_gc_busy_cmds_mean": gcb_m})
 
     cols = list(table[0].keys())
     with open(args.out_dir / "policy_comparison.csv", "w") as f:

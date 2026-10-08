@@ -76,6 +76,12 @@ oncs=$(nvme id-ctrl "$DEV" -o json | python3 -c 'import json,sys; print(json.loa
 (( oncs & 0x4 )) || fail "장치가 Dataset Management 지원을 표시하지 않음 (ONCS=$oncs). 패치한 펌웨어가 아님"
 disc_max=$(lsblk -dbno DISC-MAX "$DEV" | tr -d ' ')
 [[ "$disc_max" != "0" ]] || fail "커널이 discard를 켜지 않음 (DISC-MAX=0)"
+# 스냅샷 명령(0xC2)은 schema=3 펌웨어에만 있다. 이전 펌웨어는 모르는 admin 명령을 받으면 멈춘다.
+if [[ "${ASSUME_SCHEMA3:-0}" != "1" ]]; then
+  echo "UART의 BOOT 줄에 'schema=3' 이 보여야 합니다 (예: EXPSTAT,tag=BOOT,schema=3,snapshot_opc=0xC2,...)."
+  read -r -p "확인했으면 yes 입력: " ans
+  [[ "$ans" == "yes" ]] || fail "schema=3 펌웨어가 확인되지 않아 중단 (이전 펌웨어에 0xC2를 보내면 보드가 멈춤)"
+fi
 snap t0
 python3 "$PARSE" --show "$OUT/t0.bin" > "$OUT/t0.txt" || fail "스냅샷을 해석하지 못함"
 pass "T0 시리얼 $serial, ONCS=$oncs, DISC-MAX=$disc_max, 스냅샷 정상"
@@ -97,11 +103,13 @@ expect "dsm_req_B" "$(delta t2a t2b dsm_req_B)" "$((64 * MiB))"
 expect "dsm_inval_B" "$(delta t2a t2b dsm_inval_B)" "$((64 * MiB))"
 expect "dsm_ignored_B" "$(delta t2a t2b dsm_ignored_B)" "0"
 expect "dsm_busy_B" "$(delta t2a t2b dsm_busy_B)" "0"
-expect "dsm_err" "$(delta t2a t2b dsm_err)" "0"
+expect "dsm_errors" "$(delta t2a t2b dsm_errors)" "0"
+expect "dsm_gc_busy_cmds (GC 중이라 통째로 건너뛴 명령)" "$(delta t2a t2b dsm_gc_busy_cmds)" "0"
 trim 0 $((64 * MiB)); snap t2c
 expect "같은 범위 재요청: dsm_inval_B" "$(delta t2b t2c dsm_inval_B)" "0"
 expect "같은 범위 재요청: dsm_already_free_B" "$(delta t2b t2c dsm_already_free_B)" "$((64 * MiB))"
-# 방금 쓴 1MiB(64 slice)는 아직 data buffer에 있으므로 건너뛰어야 한다. buffer를 비운 뒤에는 무효화된다.
+# 방금 쓴 1MiB(64 slice)는 아직 data buffer에 dirty로 남아 있으므로 건너뛰어야 한다(dsm_ignored_B에 포함).
+# buffer를 비운 뒤에는 무효화된다.
 wr /dev/zero 320 1; snap t2d
 trim $((320 * MiB)) $((1 * MiB)); snap t2e
 expect "buffer에 남은 범위: dsm_busy_B" "$(delta t2d t2e dsm_busy_B)" "$((1 * MiB))"
@@ -176,7 +184,8 @@ wait "$fio_pid" || fail "fio 검증 실패: $OUT/t5_fio.txt"
 snap t5b
 (( churn >= 1 )) || fail "discard가 fio와 겹쳐 실행되지 않음"
 (( $(delta t5a t5b dsm_cmd) >= churn )) || fail "보낸 discard 수보다 펌웨어가 센 수가 적음"
-expect "dsm_err" "$(delta t5a t5b dsm_err)" "0"
+expect "dsm_errors" "$(delta t5a t5b dsm_errors)" "0"
+say "      참고 dsm_gc_busy_cmds = $(delta t5a t5b dsm_gc_busy_cmds), dsm_busy_B = $(delta t5a t5b dsm_busy_B)"
 expect "dsm_nest_err" "$(delta t5a t5b dsm_nest_err)" "0"
 expect "erase_fail" "$(delta t5a t5b erase_fail)" "0"
 pass "T5 (쓰기·discard 반복 ${churn}회)"

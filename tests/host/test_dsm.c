@@ -1,8 +1,8 @@
 /*
  * PC test for src/nvme/dsm_deallocate.c and src/exp_stat.c.
- * The two firmware files are compiled unchanged; hardware access is replaced
- * by the small functions below. This checks range arithmetic and counters,
- * not DMA or timing on the real board.
+ * The two firmware files are compiled unchanged; hardware access and the few
+ * FTL functions they call are replaced by the stand-ins below. This checks
+ * range arithmetic, buffer handling and counters, not DMA or timing on the board.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +14,8 @@
 #include "ftl_config.h"
 #include "address_translation.h"
 #include "data_buffer.h"
+#include "request_allocation.h"
+#include "memory_map.h"
 #include "exp_stat.h"
 #include "nvme/dsm_deallocate.h"
 
@@ -21,12 +23,16 @@
 P_LOGICAL_SLICE_MAP logicalSliceMapPtr;
 P_DATA_BUF_MAP dataBufMapPtr;
 P_DATA_BUF_HASH_TABLE dataBufHashTablePtr;
+P_TEMPORARY_DATA_BUF_MAP tempDataBufMapPtr;
 unsigned int storageCapacity_L;
 
-/* ---- stand-ins for hardware and FTL functions ---- */
+/* same address the module computes (first 4KB page after the baseline payload area) */
+#define PAYLOAD_ADDR ((((unsigned long)TEMPORARY_PAY_LOAD_ADDR) + 0x1FFFUL) & ~0xFFFUL)
+
+/* ---- stand-ins ---- */
 static unsigned char hostmem[2 * 4096];	/* PRP1 page, PRP2 page */
-static int cplCnt, invalCalls, dmaCalls;
-static unsigned int refuseLsa = 0xFFFFFFFF;
+static int cplCnt, dmaCalls, invalCalls;
+static unsigned int lastSC;
 
 void xil_printf(const char *f, ...) { (void)f; }
 void XTime_GetTime(XTime *t) { static XTime n; *t = n += 1000; }
@@ -40,33 +46,38 @@ void set_direct_rx_dma(unsigned int dev, unsigned int h, unsigned int l, unsigne
 	dmaCalls++;
 }
 void check_direct_rx_dma_done(void) {}
-void set_auto_rx_dma(unsigned int tag, unsigned int off, unsigned int dev, unsigned int ac)
+void set_auto_nvme_cpl(unsigned int tag, unsigned int specific, unsigned int status)
 {
-	(void)tag; (void)off; (void)ac;
-	memcpy((void *)(unsigned long)dev, hostmem, 4096);
-	dmaCalls++;
-}
-void check_auto_rx_dma_done(void) {}
-void set_auto_nvme_cpl(unsigned int a, unsigned int b, unsigned int c)
-{
-	(void)a;
-	if (b != 0 || c != 0) { printf("FAIL: completion is not success\n"); exit(2); }
+	(void)tag; (void)specific;
+	lastSC = (status >> 1) & 0xFF;	/* statusFieldWord: bit 0 phase, bits 8:1 SC */
 	cplCnt++;
 }
 void InvalidateOldVsa(unsigned int lsa)
 {
 	invalCalls++;
-	if (lsa == refuseLsa)	/* the real function returns early when the two maps disagree */
-		return;
 	logicalSliceMapPtr->logicalSlice[lsa].virtualSliceAddr = VSA_NONE;
+}
+/* copy of the logic in data_buffer.c */
+void SelectiveGetFromDataBufHashList(unsigned int e)
+{
+	if (dataBufMapPtr->dataBuf[e].logicalSliceAddr != LSA_NONE) {
+		unsigned int p = dataBufMapPtr->dataBuf[e].hashPrevEntry, n = dataBufMapPtr->dataBuf[e].hashNextEntry;
+		unsigned int h = FindDataBufHashTableEntry(dataBufMapPtr->dataBuf[e].logicalSliceAddr);
+		if (n != DATA_BUF_NONE && p != DATA_BUF_NONE) { dataBufMapPtr->dataBuf[p].hashNextEntry = n; dataBufMapPtr->dataBuf[n].hashPrevEntry = p; }
+		else if (n == DATA_BUF_NONE && p != DATA_BUF_NONE) { dataBufMapPtr->dataBuf[p].hashNextEntry = DATA_BUF_NONE; dataBufHashTablePtr->dataBufHash[h].tailEntry = p; }
+		else if (n != DATA_BUF_NONE && p == DATA_BUF_NONE) { dataBufMapPtr->dataBuf[n].hashPrevEntry = DATA_BUF_NONE; dataBufHashTablePtr->dataBufHash[h].headEntry = n; }
+		else { dataBufHashTablePtr->dataBufHash[h].headEntry = DATA_BUF_NONE; dataBufHashTablePtr->dataBufHash[h].tailEntry = DATA_BUF_NONE; }
+	}
 }
 
 /* ---- helpers ---- */
 static int fails;
 #define CHK(x) do { if (!(x)) { printf("FAIL line %d: %s\n", __LINE__, #x); fails++; } } while (0)
 #define S (&g_exp_stat)
+#define D (&dsmStats)
 #define SLICE 16384ULL
 #define LBA 4096ULL
+#define MAPPED(l) (logicalSliceMapPtr->logicalSlice[l].virtualSliceAddr != VSA_NONE)
 
 static void put(unsigned i, unsigned long long slba, unsigned nlb, unsigned off)
 {
@@ -78,138 +89,182 @@ static void put(unsigned i, unsigned long long slba, unsigned nlb, unsigned off)
 	memcpy(hostmem + off + i * 16, &r, 16);
 }
 
-static void run(unsigned nr, unsigned prp1, unsigned ad)
+static void run_ns(unsigned nr, unsigned prp1, unsigned ad, unsigned nsid)
 {
 	NVME_COMMAND cmd;
 	NVME_IO_COMMAND *c = (NVME_IO_COMMAND *)cmd.cmdDword;
 	memset(&cmd, 0, sizeof cmd);
 	cmd.cmdSlotTag = 1;
 	c->OPC = IO_NVM_DATASET_MANAGEMENT;
+	c->NSID = nsid;
 	c->dword10 = nr - 1;
 	c->dword11 = ad << 2;
 	c->PRP1[0] = prp1;
 	c->PRP2[0] = 0x1000;
 	HandleDatasetManagement(&cmd);
 }
+#define run(nr, prp1, ad) run_ns((nr), (prp1), (ad), 1)
 
-static void buffer_put(unsigned entry, unsigned lsa)	/* put one slice into the data buffer hash */
+static void buffer_put(unsigned e, unsigned lsa, int dirty)	/* one data buffer entry in the hash */
 {
-	unsigned b = FindDataBufHashTableEntry(lsa);
-	dataBufMapPtr->dataBuf[entry].logicalSliceAddr = lsa;
-	dataBufMapPtr->dataBuf[entry].hashNextEntry = dataBufHashTablePtr->dataBufHash[b].headEntry;
-	dataBufHashTablePtr->dataBufHash[b].headEntry = entry;
+	unsigned h = FindDataBufHashTableEntry(lsa);
+	DATA_BUF_ENTRY *b = &dataBufMapPtr->dataBuf[e];
+	b->logicalSliceAddr = lsa;
+	b->dirty = dirty ? DATA_BUF_DIRTY : DATA_BUF_CLEAN;
+	b->blockingReqTail = REQ_SLOT_TAG_NONE;
+	b->hashPrevEntry = dataBufHashTablePtr->dataBufHash[h].tailEntry;
+	b->hashNextEntry = DATA_BUF_NONE;
+	if (b->hashPrevEntry != DATA_BUF_NONE) dataBufMapPtr->dataBuf[b->hashPrevEntry].hashNextEntry = e;
+	else dataBufHashTablePtr->dataBufHash[h].headEntry = e;
+	dataBufHashTablePtr->dataBufHash[h].tailEntry = e;
+}
+static int in_hash(unsigned lsa)
+{
+	unsigned e = dataBufHashTablePtr->dataBufHash[FindDataBufHashTableEntry(lsa)].headEntry;
+	for (; e != DATA_BUF_NONE; e = dataBufMapPtr->dataBuf[e].hashNextEntry)
+		if (dataBufMapPtr->dataBuf[e].logicalSliceAddr == lsa) return 1;
+	return 0;
 }
 
 static exp_u64 sum(const exp_u64 *a, unsigned n) { exp_u64 s = 0; while (n--) s += a[n]; return s; }
+#define BALANCED() (S->dsm_req_bytes - rejectedReq == S->dsm_invalid_bytes + S->dsm_already_free_bytes + S->dsm_ignored_bytes)
 
 int main(int argc, char **argv)
 {
 	unsigned i;
-	exp_u64 inv, cmds;
+	exp_u64 inv, ign, rejectedReq = 0, x;
 
-	if (mmap((void *)(unsigned long)DSM_PAYLOAD_BUFFER_ADDR, 8192, PROT_READ | PROT_WRITE,
+	if (mmap((void *)PAYLOAD_ADDR, 8192, PROT_READ | PROT_WRITE,
 	         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) { perror("mmap"); return 2; }
 
 	logicalSliceMapPtr = malloc(sizeof(LOGICAL_SLICE_MAP));
 	dataBufMapPtr = calloc(1, sizeof(DATA_BUF_MAP));
 	dataBufHashTablePtr = malloc(sizeof(DATA_BUF_HASH_TABLE));
-	for (i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++)
+	tempDataBufMapPtr = malloc(sizeof(TEMPORARY_DATA_BUF_MAP));
+	for (i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
 		dataBufHashTablePtr->dataBufHash[i].headEntry = DATA_BUF_NONE;
+		dataBufHashTablePtr->dataBufHash[i].tailEntry = DATA_BUF_NONE;
+		dataBufMapPtr->dataBuf[i].logicalSliceAddr = LSA_NONE;
+	}
+	for (i = 0; i < AVAILABLE_TEMPORARY_DATA_BUFFER_ENTRY_COUNT; i++)
+		tempDataBufMapPtr->tempDataBuf[i].blockingReqTail = REQ_SLOT_TAG_NONE;
 	storageCapacity_L = 1000000;	/* 4KB blocks */
 	for (i = 0; i < SLICES_PER_SSD; i++)	/* slices 0..999 are written */
 		logicalSliceMapPtr->logicalSlice[i].virtualSliceAddr = (i < 1000) ? i : VSA_NONE;
 	exp_stat_init();
+	DsmResetStats();
 
 	/* 1. aligned range: LBA 0..63 = 16 slices */
 	put(0, 0, 64, 0); run(1, 0, 1);
-	CHK(S->dsm_cmd_count == 1); CHK(S->dsm_range_count == 1);
-	CHK(S->dsm_req_bytes == 64 * LBA); CHK(S->dsm_invalid_bytes == 16 * SLICE); CHK(S->dsm_ignored_bytes == 0);
+	CHK(lastSC == SC_SUCCESSFUL_COMPLETION);
+	CHK(S->dsm_cmd_count == 1); CHK(S->dsm_req_bytes == 64 * LBA);
+	CHK(S->dsm_invalid_bytes == 16 * SLICE); CHK(S->dsm_ignored_bytes == 0);
 
-	/* 2. same range again: nothing new, counted as already free */
+	/* 2. same range again: counted as already free */
 	run(1, 0, 1);
 	CHK(S->dsm_invalid_bytes == 16 * SLICE); CHK(S->dsm_already_free_bytes == 16 * SLICE);
 
-	/* 3. boundaries: LBA 65..74 covers only slice 17 (LBA 68..71) fully -> 6 blocks ignored */
+	/* 3. boundaries: LBA 65..74 covers only slice 17 fully -> 6 blocks ignored */
 	put(0, 65, 10, 0); run(1, 0, 1);
 	CHK(S->dsm_invalid_bytes == 17 * SLICE); CHK(S->dsm_ignored_bytes == 6 * LBA);
-	CHK(logicalSliceMapPtr->logicalSlice[16].virtualSliceAddr != VSA_NONE);
-	CHK(logicalSliceMapPtr->logicalSlice[17].virtualSliceAddr == VSA_NONE);
-	CHK(logicalSliceMapPtr->logicalSlice[18].virtualSliceAddr != VSA_NONE);
+	CHK(MAPPED(16)); CHK(!MAPPED(17)); CHK(MAPPED(18));
 
 	/* 4. range inside one slice: all ignored */
 	put(0, 81, 2, 0); run(1, 0, 1);
 	CHK(S->dsm_ignored_bytes == 8 * LBA); CHK(S->dsm_invalid_bytes == 17 * SLICE);
 
-	/* 5. beyond the capacity: ignored as a whole, map untouched */
-	inv = S->dsm_invalid_bytes; i = invalCalls;
-	put(0, 999999, 5, 0); run(1, 0, 1);
-	put(0, 0xFFFFFFF0ULL, 0x20, 0); run(1, 0, 1);
-	put(0, 0x100000000ULL, 4, 0); run(1, 0, 1);
-	CHK(S->dsm_ignored_bytes == (8 + 5 + 0x20 + 4) * LBA); CHK(S->dsm_invalid_bytes == inv); CHK((unsigned)invalCalls == i);
+	/* 5. beyond the capacity: whole command rejected, map untouched */
+	inv = S->dsm_invalid_bytes; i = invalCalls; x = S->dsm_req_bytes;
+	put(0, 400, 64, 0); put(1, 999999, 5, 0); run(2, 0, 1);
+	CHK(lastSC == SC_LBA_OUT_OF_RANGE); CHK(S->dsm_invalid_bytes == inv); CHK((unsigned)invalCalls == i);
+	CHK(MAPPED(100)); CHK(D->outOfRangeRanges == 1);
+	rejectedReq += S->dsm_req_bytes - x;
 
 	/* 6. AD = 0: completed, counted, nothing changed, payload not fetched */
-	inv = S->dsm_invalid_bytes; i = dmaCalls; cmds = S->dsm_cmd_count;
-	put(0, 400, 64, 0); run(1, 0, 0);
-	CHK(S->dsm_invalid_bytes == inv); CHK((unsigned)dmaCalls == i); CHK(S->dsm_cmd_count == cmds + 1);
-
-	/* 7. slice held in the data buffer is skipped and stays mapped */
-	buffer_put(3, 205); buffer_put(4, 205 + AVAILABLE_DATA_BUFFER_ENTRY_COUNT);	/* same hash bucket */
-	inv = S->dsm_invalid_bytes;
-	put(0, 800, 32, 0); run(1, 0, 1);	/* slices 200..207 */
-	CHK(S->dsm_invalid_bytes == inv + 7 * SLICE); CHK(S->dsm_busy_skip_bytes == SLICE);
-	CHK(logicalSliceMapPtr->logicalSlice[205].virtualSliceAddr != VSA_NONE);
-
-	/* 8. InvalidateOldVsa() refuses one slice: counted as ignored, not as invalidated */
-	refuseLsa = 301; inv = S->dsm_invalid_bytes; cmds = S->dsm_ignored_bytes;
-	put(0, 1200, 8, 0); run(1, 0, 1);	/* slices 300, 301 */
-	CHK(S->dsm_invalid_bytes == inv + SLICE); CHK(S->dsm_ignored_bytes == cmds + SLICE);
-	refuseLsa = 0xFFFFFFFF;
-
-	/* 9. zero-length range and several ranges in one command */
-	inv = S->dsm_invalid_bytes;
-	put(0, 1600, 0, 0); put(1, 1600, 4, 0); put(2, 1608, 4, 0); run(3, 0, 1);	/* slices 400, 402 */
-	CHK(S->dsm_invalid_bytes == inv + 2 * SLICE);
-
-#if !DSM_PAYLOAD_USE_AUTO_DMA
-	/* 10. 256 ranges starting at page offset 0x800: 2048 bytes via PRP1, 2048 via PRP2 */
 	inv = S->dsm_invalid_bytes; i = dmaCalls;
-	for (i = 0; i < 256; i++) put(i, 2000 + i * 8, 4, 0x800);	/* slices 500, 502, ... 1010 */
-	i = dmaCalls; run(256, 0x800, 1);
-	CHK(dmaCalls - i == 2); CHK(S->dsm_invalid_bytes == inv + 250 * SLICE);
+	put(0, 400, 64, 0); run(1, 0, 0);
+	CHK(lastSC == SC_SUCCESSFUL_COMPLETION); CHK(S->dsm_invalid_bytes == inv); CHK((unsigned)dmaCalls == i);
 
-	/* 11. payload address not 4-byte aligned: no DMA, error counted, still completed */
-	i = dmaCalls; inv = S->dsm_invalid_bytes;
+	/* 7. dirty data buffer entry: skipped, stays mapped, counted as ignored */
+	buffer_put(3, 205, 1);
+	inv = S->dsm_invalid_bytes; ign = S->dsm_ignored_bytes;
+	put(0, 800, 32, 0); run(1, 0, 1);	/* slices 200..207 */
+	CHK(S->dsm_invalid_bytes == inv + 7 * SLICE); CHK(S->dsm_ignored_bytes == ign + SLICE);
+	CHK(MAPPED(205)); CHK(D->busySkipSlices == 1); CHK(in_hash(205));
+
+	/* 8. clean idle entry: dropped from the cache, then invalidated */
+	buffer_put(4, 300, 0); buffer_put(5, 300 + AVAILABLE_DATA_BUFFER_ENTRY_COUNT, 0);	/* same bucket */
+	inv = S->dsm_invalid_bytes;
+	put(0, 1200, 4, 0); run(1, 0, 1);	/* slice 300 */
+	CHK(S->dsm_invalid_bytes == inv + SLICE); CHK(!MAPPED(300)); CHK(!in_hash(300));
+	CHK(in_hash(300 + AVAILABLE_DATA_BUFFER_ENTRY_COUNT)); CHK(D->cleanEvictSlices == 1);
+
+	/* 9. adjacent descriptors are merged: [1602,+3) + [1605,+5) = 1602..1609 covers slice 401 (1604..1607);
+	 *    neither descriptor covers a whole slice on its own */
+	inv = S->dsm_invalid_bytes;
+	put(0, 1605, 5, 0); put(1, 1602, 3, 0); run(2, 0, 1);
+	CHK(S->dsm_invalid_bytes == inv + SLICE); CHK(!MAPPED(401)); CHK(MAPPED(400)); CHK(MAPPED(402));
+
+	/* 10. GC copy in flight: whole command left alone, counted as ignored */
+	tempDataBufMapPtr->tempDataBuf[2].blockingReqTail = 7;
+	inv = S->dsm_invalid_bytes; ign = S->dsm_ignored_bytes;
+	put(0, 2000, 16, 0); run(1, 0, 1);	/* slices 500..503 */
+	CHK(lastSC == SC_SUCCESSFUL_COMPLETION); CHK(S->dsm_invalid_bytes == inv);
+	CHK(S->dsm_ignored_bytes == ign + 16 * LBA); CHK(MAPPED(500)); CHK(D->gcBusyCmds == 1);
+	tempDataBufMapPtr->tempDataBuf[2].blockingReqTail = REQ_SLOT_TAG_NONE;
+
+	/* 11. 256 ranges starting at page offset 0x800: 2048 bytes via PRP1, 2048 via PRP2 */
+	inv = S->dsm_invalid_bytes;
+	for (i = 0; i < 256; i++) put(i, 2400 + i * 8, 4, 0x800);	/* slices 600, 602, ... 1110 */
+	i = dmaCalls; run(256, 0x800, 1);
+	CHK(dmaCalls - i == 2); CHK(S->dsm_invalid_bytes == inv + 200 * SLICE);	/* 600..998 even */
+
+	/* 12. payload address not 4-byte aligned: rejected without DMA */
+	i = dmaCalls; inv = S->dsm_invalid_bytes; x = S->dsm_req_bytes;
 	put(0, 3600, 64, 0); run(1, 0x2, 1);
-	CHK((unsigned)dmaCalls == i); CHK(S->dsm_error_count == 1); CHK(S->dsm_invalid_bytes == inv);
-#endif
+	CHK(lastSC == SC_INVALID_FIELD_IN_COMMAND); CHK((unsigned)dmaCalls == i); CHK(S->dsm_invalid_bytes == inv);
+	rejectedReq += S->dsm_req_bytes - x;
+
+	/* 13. wrong namespace: rejected */
+	run_ns(1, 0, 1, 2);
+	CHK(lastSC == SC_INVALID_NAMESPACE_OR_FORMAT); CHK(D->invalidNsidCmds == 1);
 
 	/* totals */
-	CHK(S->dsm_req_bytes == S->dsm_invalid_bytes + S->dsm_already_free_bytes +
-	                        S->dsm_busy_skip_bytes + S->dsm_ignored_bytes);
+	CHK(BALANCED());
 	CHK((exp_u64)cplCnt == S->dsm_cmd_count);
 	CHK(S->dsm_nesting_error == 0); CHK(S->dsm_ticks_total > 0);
 	CHK(sum(S->dsm_hist_ticks, EXP_HIST_TICKS_NR) == S->dsm_cmd_count);
 	CHK(sum(S->dsm_hist_lba, EXP_HIST_LBA_NR) == S->dsm_cmd_count);
-	CHK(exp_log2_bucket(0, 8) == 0); CHK(exp_log2_bucket(1, 8) == 0); CHK(exp_log2_bucket(2, 8) == 1);
-	CHK(exp_log2_bucket(1023, 32) == 9); CHK(exp_log2_bucket(1024, 32) == 10); CHK(exp_log2_bucket(~0ULL, 8) == 7);
-	CHK(sizeof(exp_stat_t) % 8 == 0);
-	CHK(EXP_SNAPSHOT_HEADER_NR * 8 + sizeof(exp_stat_t) <= EXP_SNAPSHOT_BYTES);
+	CHK(exp_log2_bucket(0, 8) == 0); CHK(exp_log2_bucket(2, 8) == 1);
+	CHK(exp_log2_bucket(1024, 32) == 10); CHK(exp_log2_bucket(~0ULL, 8) == 7);
+	CHK(sizeof(exp_stat_t) % 8 == 0); CHK(sizeof(DSM_STATS) % 8 == 0);
 
-	/* snapshot files for the parser check: argv[1] = before, argv[2] = after */
-	if (argc == 3) {
+	/* snapshot layout: exp_stat section followed by the DSM section */
+	{
 		static unsigned char buf[EXP_SNAPSHOT_BYTES];
-		exp_u64 *f = (exp_u64 *)&g_exp_stat;
-		unsigned n = sizeof(exp_stat_t) / 8;
-		FILE *fp;
-
-		for (i = 0; i < n; i++) f[i] = 1000 + i;	/* field i holds 1000 + i */
-		exp_stat_snapshot(buf);
-		fp = fopen(argv[1], "wb"); fwrite(buf, 1, sizeof buf, fp); fclose(fp);
-		for (i = 0; i < n; i++) f[i] = 1000 + i + (i + 1) * 7;	/* difference of field i is 7 * (i + 1) */
-		exp_stat_snapshot(buf);
-		fp = fopen(argv[2], "wb"); fwrite(buf, 1, sizeof buf, fp); fclose(fp);
+		unsigned used = exp_stat_snapshot(buf);
+		unsigned more = DsmSnapshot(buf + used, EXP_SNAPSHOT_BYTES - used);
+		CHK(more > 0); CHK(used + more <= EXP_SNAPSHOT_BYTES);
 	}
 
-	printf("%s: %d failure(s)\n", DSM_PAYLOAD_USE_AUTO_DMA ? "auto DMA build" : "direct DMA build", fails);
+	/* snapshot files for the parser check: field i of each section holds 1000 + i, then 1000 + i + 7(i + 1) */
+	if (argc == 3) {
+		static unsigned char buf[EXP_SNAPSHOT_BYTES];
+		exp_u64 *e = (exp_u64 *)&g_exp_stat;
+		unsigned long long *d = (unsigned long long *)&dsmStats;
+		unsigned ne = sizeof(exp_stat_t) / 8, nd = sizeof(DSM_STATS) / 8, k, used;
+		const char *path[2] = { argv[1], argv[2] };
+		FILE *fp;
+
+		for (k = 0; k < 2; k++) {
+			for (i = 0; i < ne; i++) e[i] = 1000 + i + k * 7 * (i + 1);
+			for (i = 0; i < nd; i++) d[i] = 1000 + i + k * 7 * (i + 1);
+			used = exp_stat_snapshot(buf);
+			DsmSnapshot(buf + used, EXP_SNAPSHOT_BYTES - used);
+			fp = fopen(path[k], "wb"); fwrite(buf, 1, sizeof buf, fp); fclose(fp);
+		}
+	}
+
+	printf("%d failure(s)\n", fails);
 	return fails ? 1 : 0;
 }
