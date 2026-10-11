@@ -227,6 +227,42 @@ def steady_state(cycle_rows):
             "first_gc_cycle": first_gc}
 
 
+# ---------- UART 줄 시각 보정 ----------
+
+LATE_SEC = 1.0
+
+
+def retime_uart(rows):
+    """UART를 받는 PC가 잠시 멈추면(예: 윈도우 명령 프롬프트 창을 클릭해 출력이 일시 정지) 그동안 쌓인 줄이
+    한꺼번에 늦게 기록된다. 펌웨어가 줄마다 찍는 보드 시각(tick)은 그런 지연이 없으므로,
+    정상적으로 받은 줄들에서 '받은 시각 - 보드 시각'의 기준값을 구해 늦게 받은 줄의 시각을 보드 시각으로 다시 계산한다.
+    재부팅으로 tick 이 처음부터 다시 시작하면 구간을 나눠 따로 계산한다. 고친 줄 수와 최대 지연(초)을 돌려준다."""
+    segs, cur, last_tick = [], [], None
+    for r in rows:
+        if r.get("host_ns") is None or not isinstance(r.get("tick"), int) or not r.get("cps"):
+            continue
+        if last_tick is not None and r["tick"] < last_tick:
+            segs.append(cur)
+            cur = []
+        cur.append(r)
+        last_tick = r["tick"]
+    segs.append(cur)
+    fixed, worst = 0, 0.0
+    for seg in segs:
+        if len(seg) < 4:
+            continue
+        offs = sorted(r["host_ns"] - r["tick"] * 1e9 / r["cps"] for r in seg)
+        base = offs[len(offs) // 4]           # 늦게 받은 줄이 절반 가까이 돼도 흔들리지 않도록 하위 25% 값
+        for r in seg:
+            late = (r["host_ns"] - r["tick"] * 1e9 / r["cps"] - base) / 1e9
+            if late > LATE_SEC:
+                r["host_ns_received"] = r["host_ns"]
+                r["host_ns"] = int(r["tick"] * 1e9 / r["cps"] + base)
+                fixed += 1
+                worst = max(worst, late)
+    return fixed, worst
+
+
 # ---------- 실행 유효성 ----------
 
 def verdict(policy, dsm_cmd, rebooted):
@@ -248,6 +284,8 @@ def main():
     ap.add_argument("--uart", type=Path, default=None, help="UART 로그 (기본: run_dir/uart.log)")
     ap.add_argument("--skew", type=float, default=parse_expstat.DEFAULT_SKEW,
                     help="UART를 받은 PC와 호스트의 시계 차이 허용(초)")
+    ap.add_argument("--no-retime", action="store_true",
+                    help="늦게 받은 UART 줄의 시각을 보드 시각으로 고치지 않는다")
     ap.add_argument("--ftl-lba-bytes", type=int, default=512,
                     help="FEMU 로그의 lba 한 단위의 바이트 수 (기본 512)")
     args = ap.parse_args()
@@ -280,6 +318,13 @@ def main():
     if uart.exists():
         rows = parse_expstat.read_uart(uart)
         parse_expstat.check_fields(rows, uart)
+        if not args.no_retime:
+            n_fixed, worst = retime_uart(rows)
+            summary["uart_lines_retimed"] = n_fixed
+            summary["uart_max_receive_delay_sec"] = round(worst, 1)
+            if n_fixed:
+                print(f"[NOTE] UART 줄 {n_fixed}개가 늦게 기록됨(최대 {worst:.0f}초). 보드 시각으로 다시 맞춤.",
+                      file=sys.stderr)
         uart_ns = [r["host_ns"] for r in rows if r["host_ns"] is not None]
         cps = ev["checkpoints"]
         if "start" not in cps or "end" not in cps:
