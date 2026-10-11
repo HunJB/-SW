@@ -98,7 +98,8 @@ def percentile(sorted_vals, q):
 def summarize_lat(vals):
     vals = sorted(vals)
     return {"n": len(vals), "p50_ns": percentile(vals, 0.50), "p95_ns": percentile(vals, 0.95),
-            "p99_ns": percentile(vals, 0.99)}
+            "p99_ns": percentile(vals, 0.99), "p999_ns": percentile(vals, 0.999),
+            "max_ns": vals[-1] if vals else None}
 
 
 def load_latency(run_dir: Path, ev, uart_ns=()):
@@ -190,6 +191,42 @@ def compute_dead_copy(ev, gc, discards, window):
             "dead_copy_ratio": (dead / total) if total else 0.0}
 
 
+# ---------- GC victim 과 정상 상태 ----------
+
+# 펌웨어가 victim 진단 항목을 내보낼 때만 있는 값 (없으면 빈 값으로 둔다)
+VICTIM_FIELDS = ("gc_full_invalid_victim", "gc_partial_victim", "gc_partial_zero_valid")
+
+
+def victim_metrics(x):
+    """GC victim 블록 중 유효 데이터가 하나도 없던 블록의 비율, victim당 평균 복사량."""
+    out = {"gc_full_invalid_victims": x.get("gc_full_invalid_victim"),
+           "gc_partial_victims": x.get("gc_partial_victim"),
+           "full_invalid_victim_ratio": None, "gc_copy_bytes_per_victim": None}
+    full, part = x.get("gc_full_invalid_victim"), x.get("gc_partial_victim")
+    if full is not None and part is not None and full + part > 0:
+        out["full_invalid_victim_ratio"] = full / (full + part)
+    n = x.get("gc_scheduled")
+    if n:
+        out["gc_copy_bytes_per_victim"] = x.get("gc_copy_B", 0) / n
+    return out
+
+
+def steady_state(cycle_rows):
+    """측정 구간 뒤쪽 절반 cycle의 합. 장치가 처음 채워지는 동안의 GC를 빼고 정상 상태만 본다."""
+    cyc = [d for d in cycle_rows if str(d.get("to", "")).startswith("c") and d["to"][1:].isdigit()]
+    if not cyc:
+        return {}
+    last = max(int(d["to"][1:]) for d in cyc)
+    half = [d for d in cyc if int(d["to"][1:]) > last // 2]
+    host = sum(d.get("host_wr_B", 0) for d in half)
+    gc = sum(d.get("gc_copy_B", 0) for d in half)
+    first_gc = next((int(d["to"][1:]) for d in cyc if d.get("gc_scheduled", 0) > 0), None)
+    return {"steady_cycles": [last // 2 + 1, last],
+            "steady_gc_copy_bytes": gc, "steady_host_write_bytes": host,
+            "steady_gc_copy_ratio": (gc / host) if host else None,
+            "first_gc_cycle": first_gc}
+
+
 # ---------- 실행 유효성 ----------
 
 def verdict(policy, dsm_cmd, rebooted):
@@ -260,11 +297,15 @@ def main():
         order = [n for n in order if picked.get(n) is not None]
         cols = ["from", "to", "seconds", "host_wr_B", "gc_copy_B", "gc_scheduled", "erase_issued",
                 "prog_host_B", "prog_gc_B", "dsm_cmd", "dsm_req_B", "dsm_inval_B", "dsm_ignored_B"]
+        cols += [c for c in VICTIM_FIELDS if c in x]
+        cycle_rows = []
         with open(run_dir / "cycles.csv", "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(cols)
             for a, b in zip(order, order[1:]):
                 d = parse_expstat.summarize(picked[a], picked[b], rows)
+                d["from"], d["to"] = a, b
+                cycle_rows.append(d)
                 w.writerow([a, b] + [d.get(c) for c in cols[2:]])
         summary.update({
             "source": "cosmos-uart",
@@ -281,6 +322,8 @@ def main():
             "dsm_ms_total": x.get("dsm_ms_total"), "dsm_ms_mean": x.get("dsm_ms_mean"),
             "dsm_ms_max_since_boot": x.get("dsm_ms_max_since_boot"),
             "counter_seq": [x.get("seq_from"), x.get("seq_to")],
+            **victim_metrics(x),
+            **steady_state(cycle_rows),
             "verdict": verdict(policy, x.get("dsm_cmd"), x.get("rebooted")),
         })
     elif ftl_log.exists():
