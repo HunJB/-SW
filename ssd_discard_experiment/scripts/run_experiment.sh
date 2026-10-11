@@ -3,7 +3,7 @@
 #
 # 사용법 (root):
 #   EXPECTED_SERIAL=<시리얼> MNT=/mnt/ssd-test EXPSTAT=1 \
-#   ./run_experiment.sh <workload: w1|w2|w3> <policy: nodiscard|immediate|batch|split> [trim_every] [rep]
+#   ./run_experiment.sh <workload: w1|w2|w3|w4> <policy: nodiscard|immediate|batch|split> [trim_every] [rep]
 #
 # 예: W1, 5 cycle마다 fstrim, 1회차
 #   sudo -E ./run_experiment.sh w1 batch 5 1
@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 : "${MNT:?MNT 환경변수를 설정하세요}"
-WORKLOAD="${1:?워크로드 지정: w1|w2|w3}"
+WORKLOAD="${1:?워크로드 지정: w1|w2|w3|w4}"
 POLICY=$(normalize_policy "${2:?정책 지정: nodiscard|immediate|batch|split}")
 TRIM_EVERY="${3:-${TRIM_EVERY:-5}}"
 REP="${4:-1}"
@@ -43,6 +43,7 @@ case "$WORKLOAD" in
     w1) WORKLOAD_SCRIPT="$SCRIPT_DIR/workloads/w1_retention_delete.sh" ;;
     w2) WORKLOAD_SCRIPT="$SCRIPT_DIR/workloads/w2_checkpoint_rotate.sh" ;;
     w3) WORKLOAD_SCRIPT="$SCRIPT_DIR/workloads/w3_random_overwrite.sh" ;;
+    w4) WORKLOAD_SCRIPT="$SCRIPT_DIR/workloads/w4_scattered_delete.sh" ;;
     *) die "알 수 없는 워크로드: $WORKLOAD" ;;
 esac
 
@@ -107,6 +108,16 @@ print(ck, max(2, int((u * cap - (pmib << 20)) / (ck << 20))))
 PY
 )
             export CHECKPOINT_SIZE_MIB KEEP_LAST ;;
+        w4)
+            export FILE_SIZE_MIB="${FILE_SIZE_MIB:-4}"
+            read -r FILES_PER_CYCLE LIVE_FILES < <(python3 - "$CAP" "$U" "$DEL_FRAC" "$FILE_SIZE_MIB" "$PROBE_MIB" <<'PY'
+import sys
+cap, u, d, fmib, pmib = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+f = fmib << 20
+print(max(1, int(d * cap / f)), max(2, int((u * cap - (pmib << 20)) / f)))
+PY
+)
+            export FILES_PER_CYCLE LIVE_FILES ;;
         w3)
             export TARGET_FILE_SIZE_MIB="${TARGET_FILE_SIZE_MIB:-$(python3 -c "print(int(($U * $CAP) / 2**20) - $PROBE_MIB)")}" ;;
     esac
@@ -126,6 +137,7 @@ m = {
     "file_size_mib": "${FILE_SIZE_MIB:-}", "files_per_cycle": "${FILES_PER_CYCLE:-}",
     "retention_cycles": "${RETENTION_CYCLES:-}", "checkpoint_size_mib": "${CHECKPOINT_SIZE_MIB:-}",
     "keep_last": "${KEEP_LAST:-}", "target_file_size_mib": "${TARGET_FILE_SIZE_MIB:-}",
+    "live_files": "${LIVE_FILES:-}", "w4_seed": "${W4_SEED:-1}",
     "probe_iops": int("$PROBE_IOPS"), "expstat": int("$EXPSTAT"),
     "kernel": "$(uname -r)", "fio": "$(fio --version)",
     "start_time": "$(date -Iseconds)",

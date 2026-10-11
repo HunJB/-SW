@@ -22,6 +22,7 @@ ANALYZER="$REPO/ssd_discard_experiment/analysis/correlate_and_compute.py"
 AGGREGATOR="$REPO/ssd_discard_experiment/analysis/aggregate_and_plot.py"
 
 REPS="${REPS:-3}"
+WL="${WL:-w1}"           # main/poc 모드의 워크로드 (w1: 세대 단위 삭제, w4: 흩어진 삭제)
 TRIM_EVERY="${TRIM_EVERY:-5}"
 POLICIES="${POLICIES:-nodiscard immediate batch}"
 
@@ -59,13 +60,13 @@ case "$MODE" in
   main)
     for ((rep=1; rep<=REPS; rep++)); do
       for p in $POLICIES; do
-        if [[ "$p" == split ]]; then add w1 "$p" "$rep" "$SPLIT_K"; else add w1 "$p" "$rep" ""; fi
+        if [[ "$p" == split ]]; then add "$WL" "$p" "$rep" "$SPLIT_K"; else add "$WL" "$p" "$rep" ""; fi
       done
     done
     ;;
   poc)
     for p in $POLICIES; do
-      if [[ "$p" == split ]]; then add w1 "$p" 1 "$SPLIT_K"; else add w1 "$p" 1 ""; fi
+      if [[ "$p" == split ]]; then add "$WL" "$p" 1 "$SPLIT_K"; else add "$WL" "$p" 1 ""; fi
     done
     ;;
   ctrl)
@@ -83,7 +84,7 @@ esac
 echo "============================================================"
 echo "본 실험 계획"
 echo "MAIN_ROOT=$MAIN_ROOT"
-echo "MODE=$MODE / REPS=$REPS / POLICIES=$POLICIES"
+echo "MODE=$MODE / WL=$WL / REPS=$REPS / POLICIES=$POLICIES"
 echo "총 ${#PLAN[@]}회"
 echo "============================================================"
 i=0
