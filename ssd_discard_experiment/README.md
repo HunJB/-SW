@@ -23,7 +23,8 @@ ssd_discard_experiment/
 │   └── workloads/
 │       ├── w1_retention_delete.sh   보존 기간 만료형 삭제 (주 워크로드)
 │       ├── w2_checkpoint_rotate.sh  체크포인트 순환
-│       └── w3_random_overwrite.sh   삭제 없는 대조군
+│       ├── w3_random_overwrite.sh   삭제 없는 대조군
+│       └── w4_scattered_delete.sh   흩어진 삭제 (살아 있는 파일 중 무작위로 지움)
 ├── analysis/
 │   ├── correlate_and_compute.py  실행 하나를 summary.json 으로 정리
 │   └── aggregate_and_plot.py     여러 실행을 정책별 표와 그래프로
