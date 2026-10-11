@@ -89,6 +89,24 @@ python3 ../analysis/aggregate_and_plot.py ../runs --out-dir ../report
 | `fstrim_output.log` | fstrim이 보고한 TRIM 양 |
 | `summary.json` | 위를 모은 한 실행의 요약. `verdict`가 `valid`가 아니면 그 실행은 버린다 |
 
+### 정책 비교 (`aggregate_and_plot.py` 출력)
+
+| 파일 | 내용 |
+| --- | --- |
+| `policy_comparison.csv` | 정책별 평균, 표준편차, 최소, 최대와 nodiscard 대비 GC 복사량 감소율 |
+| `runs_detail.csv` | 실행 하나당 한 줄. 반복마다의 값을 그대로 보여 줄 때 쓴다 |
+| `cycle_gc_copy.csv`, `cycle_gc_copy.png` | cycle별 GC 복사량의 정책별 평균. GC가 언제 시작되고 정책 간 차이가 언제 벌어지는지 본다 |
+| `gc_copy_by_policy.png`, `waf_by_policy.png` | 측정 구간 전체의 GC 복사량과 WAF |
+| `victim_ratio_by_policy.png` | GC victim 블록 중 유효 데이터가 하나도 없던 블록의 비율 (펌웨어가 victim 항목을 낼 때만) |
+| `p99_by_policy.png` | 배경 읽기 p99. UART 출력 앞뒤 0.25초 표본을 뺀 값 |
+
+`summary.json`에는 다음 값도 들어간다.
+
+- `steady_gc_copy_bytes`, `steady_gc_copy_ratio`: 측정 cycle의 뒤쪽 절반만 합한 값. 장치가 처음 채워지는 동안을 빼고 정상 상태를 비교한다.
+- `first_gc_cycle`: GC가 처음 일어난 cycle.
+- `full_invalid_victim_ratio`, `gc_copy_bytes_per_victim`: victim 블록의 상태. discard가 GC 복사를 줄이는 이유를 직접 보여 준다.
+- 지연에는 p99와 함께 `p999_ns`, `max_ns`가 있다.
+
 `host_events.csv`의 `start_lba`는 장치 기준 4KB 블록 번호, `length_bytes`는 바이트다.
 
 ## 주의
