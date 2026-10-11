@@ -83,8 +83,20 @@ def lat(summary, phase, key="p99_ns"):
     return ((summary.get("latency_ns") or {}).get(phase) or {}).get(key)
 
 
-def label(policy, k):
-    return f"split K={k}" if policy == "split" and k is not None else str(policy)
+DEFAULT_TRIM_EVERY = 5
+
+
+def trim_tag(s):
+    """batch/split 의 TRIM 주기가 기본값(5 cycle)과 다르면 그 값. 다른 주기는 다른 조건으로 묶는다."""
+    te = s.get("trim_every")
+    if s.get("policy") in ("batch", "split") and te is not None and int(te) != DEFAULT_TRIM_EVERY:
+        return int(te)
+    return None
+
+
+def label(policy, k, te=None):
+    name = f"split K={k}" if policy == "split" and k is not None else str(policy)
+    return name + (f" T={te}" if te is not None else "")
 
 
 def main():
@@ -110,11 +122,11 @@ def main():
 
     groups = defaultdict(list)
     for s in summaries:
-        groups[(s.get("workload"), s.get("policy"), s.get("split_k"))].append(s)
-    keys = sorted(groups, key=lambda k: (str(k[0]), ORDER.get(k[1], 9), k[2] or 0))
+        groups[(s.get("workload"), s.get("policy"), s.get("split_k"), trim_tag(s))].append(s)
+    keys = sorted(groups, key=lambda k: (str(k[0]), ORDER.get(k[1], 9), k[2] or 0, k[3] or 0))
 
     baseline = {}   # (워크로드, 지표)별 nodiscard 평균
-    for (w, p, _), rows in groups.items():
+    for (w, p, _, _), rows in groups.items():
         if p == "nodiscard":
             for name in ("gc_copy_bytes", "steady_gc_copy_bytes"):
                 baseline[(w, name)] = mean_sd([r.get(name) for r in rows])[0]
@@ -127,14 +139,14 @@ def main():
         w.writerow(["run_id", "workload", "policy", "rep", "verdict"] + [n for n, _ in DETAIL])
         for key in keys:
             for r in sorted(groups[key], key=lambda r: r.get("rep") or 0):
-                w.writerow([r.get("run_id"), r.get("workload"), label(r.get("policy"), r.get("split_k")),
+                w.writerow([r.get("run_id"), r.get("workload"), label(r.get("policy"), r.get("split_k"), trim_tag(r)),
                             r.get("rep"), r.get("verdict")] + [get(r) for _, get in DETAIL])
 
     table = []
     for key in keys:
-        w, p, k = key
+        w, p, k, te = key
         rows = groups[key]
-        row = {"workload": w, "policy": label(p, k), "n_runs": len(rows)}
+        row = {"workload": w, "policy": label(p, k, te), "n_runs": len(rows)}
         for name, get in DETAIL:
             vals = [get(r) for r in rows]
             m, sd, _ = mean_sd(vals)
@@ -176,7 +188,7 @@ def main():
         for r in groups[key]:
             run_dir = r["_dir"]
             for c, gc, _ in load_cycles(run_dir):
-                per_cycle[(key[0], label(key[1], key[2]))][c].append(gc)
+                per_cycle[(key[0], label(key[1], key[2], key[3]))][c].append(gc)
     if per_cycle:
         with open(args.out_dir / "cycle_gc_copy.csv", "w", newline="") as f:
             wr = csv.writer(f)
